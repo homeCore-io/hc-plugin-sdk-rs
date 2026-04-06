@@ -10,8 +10,14 @@ use anyhow::{Context, Result};
 use hc_types::device::{change_from_command_payload, with_state_change_metadata, DeviceChange};
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, Packet, QoS};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+/// Shared tracker of MQTT topics this plugin has subscribed to.
+/// On reconnect (ConnAck), all tracked topics are re-subscribed.
+type SubscriptionTracker = Arc<Mutex<HashSet<String>>>;
 
 /// A cloneable handle for publishing device state from outside the `run()` loop.
 ///
@@ -20,6 +26,7 @@ use tracing::{debug, error, info, warn};
 pub struct DevicePublisher {
     client: AsyncClient,
     plugin_id: String,
+    subscriptions: SubscriptionTracker,
 }
 
 pub fn change_from_command(command_payload: &Value, fallback_source: &str) -> DeviceChange {
@@ -236,7 +243,8 @@ impl DevicePublisher {
             .context("DevicePublisher::register_device_full failed")
     }
 
-    /// Subscribe to command messages for a device.
+    /// Subscribe to command messages for a device and track the subscription
+    /// so it is restored on MQTT reconnect.
     ///
     /// This mirrors [`PluginClient::subscribe_commands`] but can be called
     /// from spawned tasks that only hold a `DevicePublisher` handle.
@@ -245,7 +253,9 @@ impl DevicePublisher {
         self.client
             .subscribe(&topic, QoS::AtLeastOnce)
             .await
-            .context("DevicePublisher::subscribe_commands failed")
+            .context("DevicePublisher::subscribe_commands failed")?;
+        self.subscriptions.lock().unwrap().insert(topic);
+        Ok(())
     }
 
     /// Create a `DevicePublisher` for use in unit tests.
@@ -261,6 +271,7 @@ impl DevicePublisher {
         Self {
             client,
             plugin_id: plugin_id.to_string(),
+            subscriptions: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -304,6 +315,7 @@ pub struct PluginClient {
     client: AsyncClient,
     eventloop: EventLoop,
     config: PluginConfig,
+    subscriptions: SubscriptionTracker,
 }
 
 impl PluginClient {
@@ -329,6 +341,7 @@ impl PluginClient {
             client,
             eventloop,
             config,
+            subscriptions: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -602,6 +615,7 @@ impl PluginClient {
         DevicePublisher {
             client: self.client.clone(),
             plugin_id: self.config.plugin_id.clone(),
+            subscriptions: Arc::clone(&self.subscriptions),
         }
     }
 
@@ -623,12 +637,13 @@ impl PluginClient {
         config_path: Option<String>,
         log_level_handle: Option<hc_logging::LogLevelHandle>,
     ) -> Result<ManagementHandle> {
-        // Subscribe to management command topic.
-        let topic = format!("homecore/plugins/{}/manage/cmd", self.config.plugin_id);
+        // Track management subscription for reconnect.
+        let mgmt_topic = format!("homecore/plugins/{}/manage/cmd", self.config.plugin_id);
         self.client
-            .subscribe(&topic, QoS::AtLeastOnce)
+            .subscribe(&mgmt_topic, QoS::AtLeastOnce)
             .await
             .context("subscribe management/cmd failed")?;
+        self.subscriptions.lock().unwrap().insert(mgmt_topic);
 
         // Spawn heartbeat publisher.
         let hb_client = self.client.clone();
@@ -663,12 +678,16 @@ impl PluginClient {
     // ── Command subscriptions ────────────────────────────────────────────
 
     /// Subscribe to command messages for a device.
+    ///
+    /// The subscription is tracked and automatically restored on MQTT reconnect
+    /// (clean_session=true loses subscriptions on disconnect).
     pub async fn subscribe_commands(&self, device_id: &str) -> Result<()> {
         let topic = format!("homecore/devices/{device_id}/cmd");
         self.client
             .subscribe(&topic, QoS::AtLeastOnce)
             .await
             .context("subscribe_commands failed")?;
+        self.subscriptions.lock().unwrap().insert(topic);
         debug!(device_id, "Subscribed to commands");
         Ok(())
     }
@@ -706,29 +725,25 @@ impl PluginClient {
         F: Fn(String, Value) + Send + Sync + 'static,
     {
         let plugin_id = self.config.plugin_id.clone();
+        let subs = Arc::clone(&self.subscriptions);
         info!(plugin_id = %plugin_id, "Plugin event loop starting");
         loop {
             match self.eventloop.poll().await {
                 Ok(rumqttc::Event::Incoming(Packet::ConnAck(_))) => {
                     info!("Plugin connected to broker");
-                    // Re-subscribe to device commands on every (re)connect.
+                    // Re-subscribe to all tracked topics on every (re)connect.
                     // With clean_session=true, subscriptions are lost on reconnect.
-                    let cmd_topic = "homecore/devices/+/cmd";
-                    if let Err(e) = self.client
-                        .subscribe(cmd_topic, QoS::AtLeastOnce)
-                        .await
-                    {
-                        error!(error = %e, "Failed to subscribe to device commands");
-                    }
-                    // Re-subscribe to management commands if enabled.
-                    if mgmt.is_some() {
-                        let mgmt_topic = format!("homecore/plugins/{}/manage/cmd", plugin_id);
+                    let topics: Vec<String> = subs.lock().unwrap().iter().cloned().collect();
+                    for topic in &topics {
                         if let Err(e) = self.client
-                            .subscribe(&mgmt_topic, QoS::AtLeastOnce)
+                            .subscribe(topic.as_str(), QoS::AtLeastOnce)
                             .await
                         {
-                            error!(error = %e, "Failed to re-subscribe to management commands");
+                            error!(topic, error = %e, "Failed to re-subscribe on reconnect");
                         }
+                    }
+                    if !topics.is_empty() {
+                        info!(count = topics.len(), "Re-subscribed to {} topics", topics.len());
                     }
                 }
                 Ok(rumqttc::Event::Incoming(Packet::Publish(p))) => {
