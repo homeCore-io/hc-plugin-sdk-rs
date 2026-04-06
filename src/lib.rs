@@ -711,6 +711,25 @@ impl PluginClient {
             match self.eventloop.poll().await {
                 Ok(rumqttc::Event::Incoming(Packet::ConnAck(_))) => {
                     info!("Plugin connected to broker");
+                    // Re-subscribe to device commands on every (re)connect.
+                    // With clean_session=true, subscriptions are lost on reconnect.
+                    let cmd_topic = "homecore/devices/+/cmd";
+                    if let Err(e) = self.client
+                        .subscribe(cmd_topic, QoS::AtLeastOnce)
+                        .await
+                    {
+                        error!(error = %e, "Failed to subscribe to device commands");
+                    }
+                    // Re-subscribe to management commands if enabled.
+                    if mgmt.is_some() {
+                        let mgmt_topic = format!("homecore/plugins/{}/manage/cmd", plugin_id);
+                        if let Err(e) = self.client
+                            .subscribe(&mgmt_topic, QoS::AtLeastOnce)
+                            .await
+                        {
+                            error!(error = %e, "Failed to re-subscribe to management commands");
+                        }
+                    }
                 }
                 Ok(rumqttc::Event::Incoming(Packet::Publish(p))) => {
                     let parts: Vec<&str> = p.topic.split('/').collect();
