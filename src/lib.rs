@@ -6,6 +6,8 @@
 //! - [`DevicePublisher`] — cloneable handle for publishing state from spawned tasks.
 //! - [`ManagementHandle`] — enable heartbeat + remote config/log management.
 
+pub mod mqtt_log_layer;
+
 use anyhow::{Context, Result};
 use hc_types::device::{change_from_command_payload, with_state_change_metadata, DeviceChange};
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, Packet, QoS};
@@ -348,6 +350,11 @@ impl PluginClient {
     /// Return the plugin ID.
     pub fn plugin_id(&self) -> &str {
         &self.config.plugin_id
+    }
+
+    /// Return a clone of the underlying MQTT client handle.
+    pub fn mqtt_client(&self) -> AsyncClient {
+        self.client.clone()
     }
 
     // ── Full state publishing ────────────────────────────────────────────
