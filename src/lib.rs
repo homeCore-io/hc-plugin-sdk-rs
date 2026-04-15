@@ -287,6 +287,23 @@ pub struct ManagementHandle {
     plugin_id: String,
     config_path: Option<String>,
     log_level_handle: Option<hc_logging::LogLevelHandle>,
+    custom_handler: Option<Arc<dyn Fn(&Value) -> Option<Value> + Send + Sync>>,
+}
+
+impl ManagementHandle {
+    /// Install a plugin-specific handler for actions not recognised by the
+    /// built-in dispatcher (`ping`, `get_config`, `set_config`, `set_log_level`).
+    ///
+    /// Return `Some(response)` to handle the action (the SDK fills in
+    /// `request_id` automatically), or `None` to fall through to the standard
+    /// "unknown action" error.
+    pub fn with_custom_handler<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&Value) -> Option<Value> + Send + Sync + 'static,
+    {
+        self.custom_handler = Some(Arc::new(f));
+        self
+    }
 }
 
 /// Connection configuration for a plugin.
@@ -679,6 +696,7 @@ impl PluginClient {
             plugin_id: self.config.plugin_id.clone(),
             config_path,
             log_level_handle,
+            custom_handler: None,
         })
     }
 
@@ -905,10 +923,18 @@ fn handle_management_cmd(mgmt: &ManagementHandle, cmd: &Value) -> Value {
                 })
             }
         }
-        _ => serde_json::json!({
-            "request_id": request_id,
-            "status": "error",
-            "error": format!("unknown action: {action}"),
-        }),
+        _ => {
+            if let Some(ref h) = mgmt.custom_handler {
+                if let Some(mut resp) = h(cmd) {
+                    resp["request_id"] = Value::String(request_id);
+                    return resp;
+                }
+            }
+            serde_json::json!({
+                "request_id": request_id,
+                "status": "error",
+                "error": format!("unknown action: {action}"),
+            })
+        }
     }
 }
