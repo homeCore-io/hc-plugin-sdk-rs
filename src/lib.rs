@@ -21,6 +21,11 @@ use tracing::{debug, error, info, warn};
 /// On reconnect (ConnAck), all tracked topics are re-subscribed.
 type SubscriptionTracker = Arc<Mutex<HashSet<String>>>;
 
+/// Set of device IDs this plugin has registered with HomeCore.  Shared
+/// between `PluginClient` and `DevicePublisher` so registrations from
+/// spawned tasks are reflected in the heartbeat's `device_count`.
+type DeviceTracker = Arc<Mutex<HashSet<String>>>;
+
 /// A cloneable handle for publishing device state from outside the `run()` loop.
 ///
 /// Obtained via [`PluginClient::device_publisher`] before calling `run()`.
@@ -29,6 +34,7 @@ pub struct DevicePublisher {
     client: AsyncClient,
     plugin_id: String,
     subscriptions: SubscriptionTracker,
+    devices: DeviceTracker,
 }
 
 pub fn change_from_command(command_payload: &Value, fallback_source: &str) -> DeviceChange {
@@ -178,7 +184,9 @@ impl DevicePublisher {
                 serde_json::to_vec(&serde_json::json!({ "device_id": device_id }))?,
             )
             .await
-            .context("unregister_device failed")
+            .context("unregister_device failed")?;
+        self.devices.lock().unwrap().remove(device_id);
+        Ok(())
     }
 
     // ── Plugin status ────────────────────────────────────────────────────
@@ -242,7 +250,9 @@ impl DevicePublisher {
         self.client
             .publish(&topic, QoS::AtLeastOnce, false, serde_json::to_vec(&payload)?)
             .await
-            .context("DevicePublisher::register_device_full failed")
+            .context("DevicePublisher::register_device_full failed")?;
+        self.devices.lock().unwrap().insert(device_id.to_string());
+        Ok(())
     }
 
     /// Subscribe to command messages for a device and track the subscription
@@ -274,6 +284,7 @@ impl DevicePublisher {
             client,
             plugin_id: plugin_id.to_string(),
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            devices: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -335,6 +346,7 @@ pub struct PluginClient {
     eventloop: EventLoop,
     config: PluginConfig,
     subscriptions: SubscriptionTracker,
+    devices: DeviceTracker,
 }
 
 impl PluginClient {
@@ -361,6 +373,7 @@ impl PluginClient {
             eventloop,
             config,
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            devices: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -493,6 +506,7 @@ impl PluginClient {
             )
             .await
             .context("register_device failed")?;
+        self.devices.lock().unwrap().insert(device_id.to_string());
         info!(device_id, "Device registered");
         Ok(())
     }
@@ -556,6 +570,7 @@ impl PluginClient {
             )
             .await
             .context("register_device_full failed")?;
+        self.devices.lock().unwrap().insert(device_id.to_string());
         info!(device_id, "Device registered");
         Ok(())
     }
@@ -597,6 +612,7 @@ impl PluginClient {
             )
             .await
             .context("unregister_device failed")?;
+        self.devices.lock().unwrap().remove(device_id);
         info!(device_id, "Device unregistered");
         Ok(())
     }
@@ -640,6 +656,7 @@ impl PluginClient {
             client: self.client.clone(),
             plugin_id: self.config.plugin_id.clone(),
             subscriptions: Arc::clone(&self.subscriptions),
+            devices: Arc::clone(&self.devices),
         }
     }
 
@@ -673,16 +690,19 @@ impl PluginClient {
         let hb_client = self.client.clone();
         let hb_plugin_id = self.config.plugin_id.clone();
         let hb_version = version.clone();
+        let hb_devices = Arc::clone(&self.devices);
         let started_at = std::time::Instant::now();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
             loop {
                 interval.tick().await;
                 let uptime_secs = started_at.elapsed().as_secs();
+                let device_count = hb_devices.lock().unwrap().len() as u64;
                 let payload = serde_json::json!({
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                     "version": hb_version,
                     "uptime_secs": uptime_secs,
+                    "device_count": device_count,
                 });
                 let topic = format!("homecore/plugins/{hb_plugin_id}/heartbeat");
                 let _ = hb_client
