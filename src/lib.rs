@@ -21,6 +21,10 @@ use tracing::{debug, error, info, warn};
 /// On reconnect (ConnAck), all tracked topics are re-subscribed.
 type SubscriptionTracker = Arc<Mutex<HashSet<String>>>;
 
+/// No-op state callback used when the plugin doesn't need to observe other
+/// devices (most plugins). Passed to `run_inner` from `run` / `run_managed`.
+fn noop_state_cb(_device_id: String, _state: Value) {}
+
 /// Set of device IDs this plugin has registered with HomeCore.  Shared
 /// between `PluginClient` and `DevicePublisher` so registrations from
 /// spawned tasks are reflected in the heartbeat's `device_count`.
@@ -267,6 +271,28 @@ impl DevicePublisher {
             .await
             .context("DevicePublisher::subscribe_commands failed")?;
         self.subscriptions.lock().unwrap().insert(topic);
+        Ok(())
+    }
+
+    /// Subscribe to state updates for a device this plugin does **not** own.
+    /// Tracked in the shared subscription set so reconnect restores it.
+    ///
+    /// Mirrors [`PluginClient::subscribe_state`].
+    pub async fn subscribe_state(&self, device_id: &str) -> Result<()> {
+        let topic = format!("homecore/devices/{device_id}/state");
+        self.client
+            .subscribe(&topic, QoS::AtLeastOnce)
+            .await
+            .context("DevicePublisher::subscribe_state failed")?;
+        self.subscriptions.lock().unwrap().insert(topic);
+        Ok(())
+    }
+
+    /// Remove a subscription previously added with [`subscribe_state`].
+    pub async fn unsubscribe_state(&self, device_id: &str) -> Result<()> {
+        let topic = format!("homecore/devices/{device_id}/state");
+        let _ = self.client.unsubscribe(&topic).await;
+        self.subscriptions.lock().unwrap().remove(&topic);
         Ok(())
     }
 
@@ -737,6 +763,36 @@ impl PluginClient {
         Ok(())
     }
 
+    // ── External state subscription (cross-device consumer plugins) ─────
+
+    /// Subscribe to state updates for a device this plugin does **not** own.
+    ///
+    /// Used by cross-device consumer plugins (e.g. thermostats observing
+    /// external temperature sensors). The subscription is tracked and
+    /// automatically restored on MQTT reconnect, just like
+    /// [`subscribe_commands`].
+    ///
+    /// Use [`run_managed_with_state`] to receive these messages in a callback.
+    pub async fn subscribe_state(&self, device_id: &str) -> Result<()> {
+        let topic = format!("homecore/devices/{device_id}/state");
+        self.client
+            .subscribe(&topic, QoS::AtLeastOnce)
+            .await
+            .context("subscribe_state failed")?;
+        self.subscriptions.lock().unwrap().insert(topic);
+        debug!(device_id, "Subscribed to external device state");
+        Ok(())
+    }
+
+    /// Remove a subscription previously added with [`subscribe_state`].
+    pub async fn unsubscribe_state(&self, device_id: &str) -> Result<()> {
+        let topic = format!("homecore/devices/{device_id}/state");
+        let _ = self.client.unsubscribe(&topic).await;
+        self.subscriptions.lock().unwrap().remove(&topic);
+        debug!(device_id, "Unsubscribed from external device state");
+        Ok(())
+    }
+
     // ── Event loop ───────────────────────────────────────────────────────
 
     /// Drive the MQTT event loop, calling `on_command` whenever a `cmd`
@@ -747,7 +803,7 @@ impl PluginClient {
     where
         F: Fn(String, Value) + Send + Sync + 'static,
     {
-        self.run_inner(on_command, None).await
+        self.run_inner(on_command, noop_state_cb, None).await
     }
 
     /// Like [`run`], but also handles management protocol commands (heartbeat
@@ -758,16 +814,35 @@ impl PluginClient {
     where
         F: Fn(String, Value) + Send + Sync + 'static,
     {
-        self.run_inner(on_command, Some(mgmt)).await
+        self.run_inner(on_command, noop_state_cb, Some(mgmt)).await
     }
 
-    async fn run_inner<F>(
+    /// Like [`run_managed`], but additionally delivers state updates for any
+    /// device subscribed to via [`subscribe_state`] into `on_state`.
+    ///
+    /// Use for cross-device consumer plugins (e.g. thermostat observes sensors).
+    pub async fn run_managed_with_state<F, S>(
+        mut self,
+        on_command: F,
+        on_state: S,
+        mgmt: ManagementHandle,
+    ) -> Result<()>
+    where
+        F: Fn(String, Value) + Send + Sync + 'static,
+        S: Fn(String, Value) + Send + Sync + 'static,
+    {
+        self.run_inner(on_command, on_state, Some(mgmt)).await
+    }
+
+    async fn run_inner<F, S>(
         &mut self,
         on_command: F,
+        on_state: S,
         mgmt: Option<ManagementHandle>,
     ) -> Result<()>
     where
         F: Fn(String, Value) + Send + Sync + 'static,
+        S: Fn(String, Value) + Send + Sync + 'static,
     {
         let plugin_id = self.config.plugin_id.clone();
         let subs = Arc::clone(&self.subscriptions);
@@ -804,6 +879,20 @@ impl PluginClient {
                         match serde_json::from_slice::<Value>(&p.payload) {
                             Ok(cmd) => on_command(device_id, cmd),
                             Err(e) => warn!(topic = %p.topic, error = %e, "Non-JSON cmd payload"),
+                        }
+                        continue;
+                    }
+
+                    // homecore/devices/{id}/state (for subscribe_state consumers)
+                    if parts.len() == 4
+                        && parts[0] == "homecore"
+                        && parts[1] == "devices"
+                        && parts[3] == "state"
+                    {
+                        let device_id = parts[2].to_string();
+                        match serde_json::from_slice::<Value>(&p.payload) {
+                            Ok(state) => on_state(device_id, state),
+                            Err(e) => warn!(topic = %p.topic, error = %e, "Non-JSON state payload"),
                         }
                         continue;
                     }
