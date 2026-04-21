@@ -252,7 +252,12 @@ impl DevicePublisher {
             payload["capabilities"] = c;
         }
         self.client
-            .publish(&topic, QoS::AtLeastOnce, false, serde_json::to_vec(&payload)?)
+            .publish(
+                &topic,
+                QoS::AtLeastOnce,
+                false,
+                serde_json::to_vec(&payload)?,
+            )
             .await
             .context("DevicePublisher::register_device_full failed")?;
         self.devices.lock().unwrap().insert(device_id.to_string());
@@ -279,20 +284,31 @@ impl DevicePublisher {
     ///
     /// Mirrors [`PluginClient::subscribe_state`].
     pub async fn subscribe_state(&self, device_id: &str) -> Result<()> {
-        let topic = format!("homecore/devices/{device_id}/state");
+        let topic_full = format!("homecore/devices/{device_id}/state");
+        let topic_partial = format!("homecore/devices/{device_id}/state/partial");
         self.client
-            .subscribe(&topic, QoS::AtLeastOnce)
+            .subscribe(&topic_full, QoS::AtLeastOnce)
             .await
-            .context("DevicePublisher::subscribe_state failed")?;
-        self.subscriptions.lock().unwrap().insert(topic);
+            .context("DevicePublisher::subscribe_state (full) failed")?;
+        self.client
+            .subscribe(&topic_partial, QoS::AtLeastOnce)
+            .await
+            .context("DevicePublisher::subscribe_state (partial) failed")?;
+        let mut subs = self.subscriptions.lock().unwrap();
+        subs.insert(topic_full);
+        subs.insert(topic_partial);
         Ok(())
     }
 
     /// Remove a subscription previously added with [`subscribe_state`].
     pub async fn unsubscribe_state(&self, device_id: &str) -> Result<()> {
-        let topic = format!("homecore/devices/{device_id}/state");
-        let _ = self.client.unsubscribe(&topic).await;
-        self.subscriptions.lock().unwrap().remove(&topic);
+        let topic_full = format!("homecore/devices/{device_id}/state");
+        let topic_partial = format!("homecore/devices/{device_id}/state/partial");
+        let _ = self.client.unsubscribe(&topic_full).await;
+        let _ = self.client.unsubscribe(&topic_partial).await;
+        let mut subs = self.subscriptions.lock().unwrap();
+        subs.remove(&topic_full);
+        subs.remove(&topic_partial);
         Ok(())
     }
 
@@ -732,7 +748,12 @@ impl PluginClient {
                 });
                 let topic = format!("homecore/plugins/{hb_plugin_id}/heartbeat");
                 let _ = hb_client
-                    .publish(&topic, QoS::AtMostOnce, false, serde_json::to_vec(&payload).unwrap_or_default())
+                    .publish(
+                        &topic,
+                        QoS::AtMostOnce,
+                        false,
+                        serde_json::to_vec(&payload).unwrap_or_default(),
+                    )
                     .await;
             }
         });
@@ -774,21 +795,37 @@ impl PluginClient {
     ///
     /// Use [`run_managed_with_state`] to receive these messages in a callback.
     pub async fn subscribe_state(&self, device_id: &str) -> Result<()> {
-        let topic = format!("homecore/devices/{device_id}/state");
+        let topic_full = format!("homecore/devices/{device_id}/state");
+        let topic_partial = format!("homecore/devices/{device_id}/state/partial");
         self.client
-            .subscribe(&topic, QoS::AtLeastOnce)
+            .subscribe(&topic_full, QoS::AtLeastOnce)
             .await
-            .context("subscribe_state failed")?;
-        self.subscriptions.lock().unwrap().insert(topic);
-        debug!(device_id, "Subscribed to external device state");
+            .context("subscribe_state (full) failed")?;
+        self.client
+            .subscribe(&topic_partial, QoS::AtLeastOnce)
+            .await
+            .context("subscribe_state (partial) failed")?;
+        {
+            let mut subs = self.subscriptions.lock().unwrap();
+            subs.insert(topic_full);
+            subs.insert(topic_partial);
+        }
+        debug!(
+            device_id,
+            "Subscribed to external device state (full + partial)"
+        );
         Ok(())
     }
 
     /// Remove a subscription previously added with [`subscribe_state`].
     pub async fn unsubscribe_state(&self, device_id: &str) -> Result<()> {
-        let topic = format!("homecore/devices/{device_id}/state");
-        let _ = self.client.unsubscribe(&topic).await;
-        self.subscriptions.lock().unwrap().remove(&topic);
+        let topic_full = format!("homecore/devices/{device_id}/state");
+        let topic_partial = format!("homecore/devices/{device_id}/state/partial");
+        let _ = self.client.unsubscribe(&topic_full).await;
+        let _ = self.client.unsubscribe(&topic_partial).await;
+        let mut subs = self.subscriptions.lock().unwrap();
+        subs.remove(&topic_full);
+        subs.remove(&topic_partial);
         debug!(device_id, "Unsubscribed from external device state");
         Ok(())
     }
@@ -855,7 +892,8 @@ impl PluginClient {
                     // With clean_session=true, subscriptions are lost on reconnect.
                     let topics: Vec<String> = subs.lock().unwrap().iter().cloned().collect();
                     for topic in &topics {
-                        if let Err(e) = self.client
+                        if let Err(e) = self
+                            .client
                             .subscribe(topic.as_str(), QoS::AtLeastOnce)
                             .await
                         {
@@ -863,7 +901,11 @@ impl PluginClient {
                         }
                     }
                     if !topics.is_empty() {
-                        info!(count = topics.len(), "Re-subscribed to {} topics", topics.len());
+                        info!(
+                            count = topics.len(),
+                            "Re-subscribed to {} topics",
+                            topics.len()
+                        );
                     }
                 }
                 Ok(rumqttc::Event::Incoming(Packet::Publish(p))) => {
@@ -883,7 +925,7 @@ impl PluginClient {
                         continue;
                     }
 
-                    // homecore/devices/{id}/state (for subscribe_state consumers)
+                    // homecore/devices/{id}/state (full state, for subscribe_state consumers)
                     if parts.len() == 4
                         && parts[0] == "homecore"
                         && parts[1] == "devices"
@@ -893,6 +935,25 @@ impl PluginClient {
                         match serde_json::from_slice::<Value>(&p.payload) {
                             Ok(state) => on_state(device_id, state),
                             Err(e) => warn!(topic = %p.topic, error = %e, "Non-JSON state payload"),
+                        }
+                        continue;
+                    }
+
+                    // homecore/devices/{id}/state/partial (merge patch — delivered
+                    // to the same callback so cross-device consumers that read
+                    // specific attributes see updates between full-state pushes).
+                    if parts.len() == 5
+                        && parts[0] == "homecore"
+                        && parts[1] == "devices"
+                        && parts[3] == "state"
+                        && parts[4] == "partial"
+                    {
+                        let device_id = parts[2].to_string();
+                        match serde_json::from_slice::<Value>(&p.payload) {
+                            Ok(state) => on_state(device_id, state),
+                            Err(e) => {
+                                warn!(topic = %p.topic, error = %e, "Non-JSON state/partial payload")
+                            }
                         }
                         continue;
                     }
@@ -907,11 +968,10 @@ impl PluginClient {
                         {
                             if let Ok(cmd) = serde_json::from_slice::<Value>(&p.payload) {
                                 let resp = handle_management_cmd(mgmt, &cmd);
-                                let resp_topic = format!(
-                                    "homecore/plugins/{}/manage/response",
-                                    mgmt.plugin_id
-                                );
-                                let _ = self.client
+                                let resp_topic =
+                                    format!("homecore/plugins/{}/manage/response", mgmt.plugin_id);
+                                let _ = self
+                                    .client
                                     .publish(
                                         &resp_topic,
                                         QoS::AtLeastOnce,
@@ -971,14 +1031,17 @@ fn handle_management_cmd(mgmt: &ManagementHandle, cmd: &Value) -> Value {
                     s.to_string()
                 } else if let Some(obj) = cmd["config"].as_object() {
                     // JSON object → TOML
-                    let toml_val: toml::Value = match serde_json::from_value(Value::Object(obj.clone())) {
-                        Ok(v) => v,
-                        Err(e) => return serde_json::json!({
-                            "request_id": request_id,
-                            "status": "error",
-                            "error": format!("invalid config: {e}"),
-                        }),
-                    };
+                    let toml_val: toml::Value =
+                        match serde_json::from_value(Value::Object(obj.clone())) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return serde_json::json!({
+                                    "request_id": request_id,
+                                    "status": "error",
+                                    "error": format!("invalid config: {e}"),
+                                })
+                            }
+                        };
                     toml::to_string_pretty(&toml_val).unwrap_or_default()
                 } else {
                     return serde_json::json!({
@@ -1024,7 +1087,10 @@ fn handle_management_cmd(mgmt: &ManagementHandle, cmd: &Value) -> Value {
                     }),
                 }
             } else {
-                info!(level, "Management: log level change requested (no reload handle; requires restart)");
+                info!(
+                    level,
+                    "Management: log level change requested (no reload handle; requires restart)"
+                );
                 serde_json::json!({
                     "request_id": request_id,
                     "status": "ok",

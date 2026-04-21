@@ -106,12 +106,9 @@ impl<S: Subscriber> Layer<S> for MqttLogLayer {
 
 impl MqttLogLayer {
     fn client_try_publish(&self, state: &Inner, payload: Vec<u8>) {
-        let _ = state.client.try_publish(
-            &state.topic,
-            QoS::AtMostOnce,
-            false,
-            payload,
-        );
+        let _ = state
+            .client
+            .try_publish(&state.topic, QoS::AtMostOnce, false, payload);
     }
 }
 
