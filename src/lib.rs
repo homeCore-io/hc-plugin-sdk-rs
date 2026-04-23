@@ -341,6 +341,9 @@ pub struct ManagementHandle {
     config_path: Option<String>,
     log_level_handle: Option<hc_logging::LogLevelHandle>,
     custom_handler: Option<Arc<dyn Fn(&Value) -> Option<Value> + Send + Sync>>,
+    /// Capability manifest, published retained on
+    /// `homecore/plugins/{id}/capabilities` after the first CONNACK.
+    capabilities: Option<hc_types::Capabilities>,
 }
 
 impl ManagementHandle {
@@ -355,6 +358,23 @@ impl ManagementHandle {
         F: Fn(&Value) -> Option<Value> + Send + Sync + 'static,
     {
         self.custom_handler = Some(Arc::new(f));
+        self
+    }
+
+    /// Declare the plugin's capability manifest. The SDK publishes it
+    /// retained on `homecore/plugins/{id}/capabilities` after each CONNACK
+    /// so reconnects refresh the cached manifest.
+    ///
+    /// `spec` and `plugin_id` are set by the SDK if empty — callers only
+    /// need to provide the `actions` list in most cases.
+    pub fn with_capabilities(mut self, mut caps: hc_types::Capabilities) -> Self {
+        if caps.spec.is_empty() {
+            caps.spec = "1".into();
+        }
+        if caps.plugin_id.is_empty() {
+            caps.plugin_id = self.plugin_id.clone();
+        }
+        self.capabilities = Some(caps);
         self
     }
 }
@@ -764,6 +784,7 @@ impl PluginClient {
             config_path,
             log_level_handle,
             custom_handler: None,
+            capabilities: None,
         })
     }
 
@@ -906,6 +927,28 @@ impl PluginClient {
                             "Re-subscribed to {} topics",
                             topics.len()
                         );
+                    }
+                    // Republish capability manifest retained, if declared.
+                    // Retained so late-joining core instances still see it.
+                    if let Some(ref mgmt) = mgmt {
+                        if let Some(ref caps) = mgmt.capabilities {
+                            let topic =
+                                format!("homecore/plugins/{}/capabilities", mgmt.plugin_id);
+                            match serde_json::to_vec(caps) {
+                                Ok(bytes) => {
+                                    if let Err(e) = self
+                                        .client
+                                        .publish(&topic, QoS::AtLeastOnce, true, bytes)
+                                        .await
+                                    {
+                                        warn!(error = %e, "Failed to publish capabilities");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to serialise capabilities");
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(rumqttc::Event::Incoming(Packet::Publish(p))) => {
