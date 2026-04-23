@@ -7,15 +7,18 @@
 //! - [`ManagementHandle`] — enable heartbeat + remote config/log management.
 
 pub mod mqtt_log_layer;
+pub mod streaming;
 
 use anyhow::{Context, Result};
 use hc_types::device::{change_from_command_payload, with_state_change_metadata, DeviceChange};
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, Packet, QoS};
-use serde_json::Value;
-use std::collections::HashSet;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+pub use streaming::{StreamContext, StreamingAction};
 
 /// Shared tracker of MQTT topics this plugin has subscribed to.
 /// On reconnect (ConnAck), all tracked topics are re-subscribed.
@@ -344,6 +347,11 @@ pub struct ManagementHandle {
     /// Capability manifest, published retained on
     /// `homecore/plugins/{id}/capabilities` after the first CONNACK.
     capabilities: Option<hc_types::Capabilities>,
+    /// Registered streaming action handlers, indexed by action id.
+    streaming_actions: Arc<HashMap<String, StreamingAction>>,
+    /// Live streams, keyed by `request_id`. Entries are added on
+    /// dispatch and removed after the action closure exits.
+    active_streams: streaming::ActiveStreams,
 }
 
 impl ManagementHandle {
@@ -375,6 +383,21 @@ impl ManagementHandle {
             caps.plugin_id = self.plugin_id.clone();
         }
         self.capabilities = Some(caps);
+        self
+    }
+
+    /// Register a handler for a streaming action declared in the
+    /// capability manifest. When `homecore/plugins/{id}/manage/cmd`
+    /// receives a command whose `action` matches `action.id()`, the SDK
+    /// replies `status:"accepted"` and spawns the closure with a fresh
+    /// [`StreamContext`]. The closure must emit exactly one terminal
+    /// stage before returning.
+    pub fn with_streaming_action(mut self, action: StreamingAction) -> Self {
+        // Arc<HashMap<_,_>> is immutable after clone; rebuild on add.
+        let mut map: HashMap<String, StreamingAction> =
+            (*self.streaming_actions).clone();
+        map.insert(action.id.clone(), action);
+        self.streaming_actions = Arc::new(map);
         self
     }
 }
@@ -785,6 +808,8 @@ impl PluginClient {
             log_level_handle,
             custom_handler: None,
             capabilities: None,
+            streaming_actions: Arc::new(HashMap::new()),
+            active_streams: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1010,7 +1035,12 @@ impl PluginClient {
                             && parts[4] == "cmd"
                         {
                             if let Ok(cmd) = serde_json::from_slice::<Value>(&p.payload) {
-                                let resp = handle_management_cmd(mgmt, &cmd);
+                                let resp = dispatch_management_cmd(
+                                    mgmt,
+                                    &self.client,
+                                    &cmd,
+                                )
+                                .await;
                                 let resp_topic =
                                     format!("homecore/plugins/{}/manage/response", mgmt.plugin_id);
                                 let _ = self
@@ -1034,6 +1064,172 @@ impl PluginClient {
             }
         }
     }
+}
+
+/// Top-level management-cmd dispatcher. Handles streaming actions
+/// (`action` matches a registered `StreamingAction`), `cancel`, and
+/// `respond` before falling through to the sync built-in handler.
+async fn dispatch_management_cmd(
+    mgmt: &ManagementHandle,
+    client: &AsyncClient,
+    cmd: &Value,
+) -> Value {
+    let action = cmd["action"].as_str().unwrap_or("").to_string();
+    let request_id = cmd["request_id"].as_str().unwrap_or("").to_string();
+
+    // `cancel` — flip the cancel flag on the targeted active stream.
+    if action == "cancel" {
+        let Some(target) = cmd["target_request_id"].as_str() else {
+            return json!({
+                "request_id": request_id,
+                "status": "error",
+                "error": "cancel requires target_request_id",
+            });
+        };
+        let found = {
+            let map = mgmt.active_streams.lock().unwrap();
+            if let Some(entry) = map.get(target) {
+                entry.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        };
+        if found {
+            return json!({ "request_id": request_id, "status": "ok" });
+        } else {
+            return json!({
+                "request_id": request_id,
+                "status": "error",
+                "error": "no active stream for target_request_id",
+            });
+        }
+    }
+
+    // `respond` — deliver response payload to the targeted active stream.
+    if action == "respond" {
+        let Some(target) = cmd["target_request_id"].as_str() else {
+            return json!({
+                "request_id": request_id,
+                "status": "error",
+                "error": "respond requires target_request_id",
+            });
+        };
+        let response = cmd
+            .get("response")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        let delivered = {
+            let map = mgmt.active_streams.lock().unwrap();
+            match map.get(target) {
+                Some(entry) => entry.respond_tx.send(response).is_ok(),
+                None => false,
+            }
+        };
+        if delivered {
+            return json!({ "request_id": request_id, "status": "ok" });
+        } else {
+            return json!({
+                "request_id": request_id,
+                "status": "error",
+                "error": "no active awaiting_user stream for target_request_id",
+            });
+        }
+    }
+
+    // Streaming action match?
+    if let Some(streaming_action) = mgmt.streaming_actions.get(&action) {
+        return dispatch_streaming_action(mgmt, client, streaming_action, cmd).await;
+    }
+
+    // Fall through to synchronous built-ins + custom handler.
+    handle_management_cmd(mgmt, cmd)
+}
+
+/// Dispatch a streaming action: register state, spawn the closure, and
+/// return the sync `accepted` reply with the stream topic.
+async fn dispatch_streaming_action(
+    mgmt: &ManagementHandle,
+    client: &AsyncClient,
+    action: &StreamingAction,
+    cmd: &Value,
+) -> Value {
+    let request_id = cmd["request_id"].as_str().unwrap_or("").to_string();
+    if request_id.is_empty() {
+        return json!({
+            "status": "error",
+            "error": "streaming action requires request_id on the command",
+        });
+    }
+
+    // Extract params: everything except action/request_id/target_request_id.
+    let params = {
+        let mut p = cmd.clone();
+        if let Some(obj) = p.as_object_mut() {
+            obj.remove("action");
+            obj.remove("request_id");
+            obj.remove("target_request_id");
+        }
+        p
+    };
+
+    let stream_topic = format!(
+        "homecore/plugins/{}/commands/{}/events",
+        mgmt.plugin_id, request_id
+    );
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (respond_tx, respond_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+
+    {
+        let mut map = mgmt.active_streams.lock().unwrap();
+        map.insert(
+            request_id.clone(),
+            streaming::ActiveStreamEntry {
+                cancel: Arc::clone(&cancel),
+                respond_tx,
+            },
+        );
+    }
+
+    let ctx = StreamContext::new(
+        request_id.clone(),
+        mgmt.plugin_id.clone(),
+        action.id.clone(),
+        client.clone(),
+        Arc::clone(&cancel),
+        Arc::clone(&terminal),
+        respond_rx,
+    );
+
+    let handler = Arc::clone(&action.handler);
+    let registry = Arc::clone(&mgmt.active_streams);
+    let rid_clone = request_id.clone();
+    let topic_clone = stream_topic.clone();
+    let terminal_clone = Arc::clone(&terminal);
+    let client_clone = client.clone();
+
+    tokio::spawn(async move {
+        let result = handler(ctx, params).await;
+        streaming::finalize_stream(
+            &client_clone,
+            &topic_clone,
+            &rid_clone,
+            &terminal_clone,
+            result,
+        )
+        .await;
+        // Clean up registry entry after finalize — any late cancel/respond
+        // after terminal becomes a no-op.
+        let mut map = registry.lock().unwrap();
+        map.remove(&rid_clone);
+    });
+
+    json!({
+        "request_id": request_id,
+        "status": "accepted",
+        "stream_topic": stream_topic,
+    })
 }
 
 /// Handle a management command and return a JSON response.
