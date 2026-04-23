@@ -157,16 +157,46 @@ impl StreamContext {
         prompt: impl Into<String>,
         response_schema: Value,
     ) -> Result<Value> {
+        self.emit_awaiting_user_with_schema(prompt, response_schema)
+            .await?;
+        self.await_respond().await
+    }
+
+    /// Emit only the `awaiting_user` event with `response_schema`, without
+    /// blocking on the respond. Use with [`StreamContext::await_respond`]
+    /// when the plugin needs to handle other work (e.g. live controller
+    /// events) concurrently with the prompt.
+    pub async fn emit_awaiting_user_with_schema(
+        &self,
+        prompt: impl Into<String>,
+        response_schema: Value,
+    ) -> Result<()> {
         self.emit_non_terminal(json!({
             "stage": "awaiting_user",
             "prompt": prompt.into(),
             "response_schema": response_schema,
         }))
-        .await?;
+        .await
+    }
+
+    /// Await the next `respond` command payload. Pairs with
+    /// [`StreamContext::emit_awaiting_user_with_schema`] when the plugin
+    /// is also processing other async work.
+    pub async fn await_respond(&self) -> Result<Value> {
         let mut rx = self.respond_rx.lock().await;
         rx.recv()
             .await
             .ok_or_else(|| anyhow!("respond channel closed before response arrived"))
+    }
+
+    /// Resolves when a `cancel` command has flipped the cancel token.
+    /// Cooperative — use inside `tokio::select!` so a long-running action
+    /// exits promptly. Plugins must still call [`StreamContext::canceled`]
+    /// to emit the terminal stage.
+    pub async fn wait_canceled(&self) {
+        while !self.is_canceled() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// Emit a `progress` event.
