@@ -28,10 +28,84 @@ type SubscriptionTracker = Arc<Mutex<HashSet<String>>>;
 /// devices (most plugins). Passed to `run_inner` from `run` / `run_managed`.
 fn noop_state_cb(_device_id: String, _state: Value) {}
 
-/// Set of device IDs this plugin has registered with HomeCore.  Shared
-/// between `PluginClient` and `DevicePublisher` so registrations from
-/// spawned tasks are reflected in the heartbeat's `device_count`.
-type DeviceTracker = Arc<Mutex<HashSet<String>>>;
+/// Inner state of the device tracker. Holds the set of device_ids this
+/// plugin has registered with HomeCore plus an optional path to mirror
+/// the set onto disk so it survives plugin restarts.
+///
+/// Persistence is opt-in via [`PluginClient::with_device_persistence`]
+/// or [`DevicePublisher::enable_persistence`]. When enabled, every
+/// register/unregister mutation is followed by a synchronous JSON
+/// write — fine for the typical scale (dozens to a few hundred
+/// devices) and avoids any reconnect/restart races.
+#[derive(Default)]
+pub(crate) struct DeviceTrackerInner {
+    set: HashSet<String>,
+    persist_path: Option<std::path::PathBuf>,
+}
+
+impl DeviceTrackerInner {
+    fn enable_persistence(&mut self, path: std::path::PathBuf) {
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&body) {
+                self.set.extend(ids);
+            }
+        }
+        self.persist_path = Some(path);
+    }
+
+    fn insert(&mut self, id: &str) {
+        if self.set.insert(id.to_string()) {
+            self.save();
+        }
+    }
+
+    fn remove(&mut self, id: &str) {
+        if self.set.remove(id) {
+            self.save();
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    fn snapshot(&self) -> HashSet<String> {
+        self.set.clone()
+    }
+
+    fn save(&self) {
+        let Some(p) = &self.persist_path else { return };
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut sorted: Vec<&String> = self.set.iter().collect();
+        sorted.sort();
+        if let Ok(body) = serde_json::to_vec_pretty(&sorted) {
+            if let Err(e) = std::fs::write(p, body) {
+                warn!(path = %p.display(), error = %e, "device tracker persistence write failed");
+            }
+        }
+    }
+}
+
+/// Shared tracker of device IDs this plugin has registered with HomeCore.
+/// Shared between `PluginClient` and `DevicePublisher` so registrations
+/// from spawned tasks are reflected in the heartbeat's `device_count`
+/// and in `reconcile_devices`.
+type DeviceTracker = Arc<Mutex<DeviceTrackerInner>>;
+
+/// Outcome of [`DevicePublisher::reconcile_devices`].
+#[derive(Debug, Default)]
+pub struct ReconcileReport {
+    /// Device IDs that were registered before this reconcile but are
+    /// not in the supplied `live` set, so were unregistered.
+    pub stale_unregistered: Vec<String>,
+    /// Device IDs that were in the `live` set but had not been
+    /// registered. Usually empty — non-empty means the caller passed
+    /// a live set that includes devices it never registered with the
+    /// SDK. Logged for diagnostic value, no action taken.
+    pub unknown_in_live: Vec<String>,
+}
 
 /// A cloneable handle for publishing device state from outside the `run()` loop.
 ///
@@ -263,8 +337,79 @@ impl DevicePublisher {
             )
             .await
             .context("DevicePublisher::register_device_full failed")?;
-        self.devices.lock().unwrap().insert(device_id.to_string());
+        self.devices.lock().unwrap().insert(device_id);
         Ok(())
+    }
+
+    /// Enable cross-restart persistence for the device tracker.
+    ///
+    /// Loads any previously-saved device IDs from `path` into the
+    /// in-memory tracker, then mirrors every register/unregister
+    /// mutation back to disk. Combined with [`Self::reconcile_devices`]
+    /// this gives plugins a "set what's live this cycle, SDK cleans
+    /// up everything else" workflow that survives plugin restarts.
+    ///
+    /// Idempotent — call once at startup, before the first
+    /// `register_device_full` of the session. Multiple calls re-load
+    /// from the same path which is harmless but pointless.
+    ///
+    /// Path is typically `<config_dir>/.published-device-ids.json`.
+    pub fn enable_persistence(&self, path: std::path::PathBuf) {
+        self.devices.lock().unwrap().enable_persistence(path);
+    }
+
+    /// Reconcile the live device set against everything this plugin
+    /// has ever registered (both in-session via `register_device_full`
+    /// and across restarts when persistence is enabled).
+    ///
+    /// `live` should be the set of device_ids the plugin's authoritative
+    /// upstream (Hue bridge, Z-Wave network, YoLink cloud, etc.)
+    /// reports as currently existing. Anything previously registered
+    /// but absent from `live` gets `unregister_device`d, removed from
+    /// the tracker, and (if persistence is on) the new live set is
+    /// written to disk.
+    ///
+    /// Caller is responsible for not invoking this when an upstream
+    /// fetch failed — a partial live set would otherwise wipe legit
+    /// devices behind a temporarily-unreachable upstream. Typical
+    /// pattern: track an `all_bridges_succeeded` flag, only call
+    /// `reconcile_devices` when true.
+    ///
+    /// New devices in `live` that the plugin hasn't yet registered
+    /// are reported in `unknown_in_live` but otherwise ignored — call
+    /// `register_device_full` for them first to bring them into the
+    /// tracker.
+    pub async fn reconcile_devices(
+        &self,
+        live: HashSet<String>,
+    ) -> Result<ReconcileReport> {
+        let known = self.devices.lock().unwrap().snapshot();
+        let stale: Vec<String> = known.difference(&live).cloned().collect();
+        let unknown_in_live: Vec<String> = live.difference(&known).cloned().collect();
+        let mut unregistered = Vec::with_capacity(stale.len());
+        for id in &stale {
+            match self.unregister_device(&self.plugin_id, id).await {
+                Ok(()) => {
+                    unregistered.push(id.clone());
+                    info!(plugin_id = %self.plugin_id, device_id = %id, "Unregistered stale device");
+                }
+                Err(e) => {
+                    warn!(plugin_id = %self.plugin_id, device_id = %id, error = %e, "Failed to unregister stale device");
+                }
+            }
+        }
+        if !unknown_in_live.is_empty() {
+            debug!(
+                plugin_id = %self.plugin_id,
+                count = unknown_in_live.len(),
+                "reconcile_devices saw live ids not yet registered with the SDK; \
+                 caller should `register_device_full` first"
+            );
+        }
+        Ok(ReconcileReport {
+            stale_unregistered: unregistered,
+            unknown_in_live,
+        })
     }
 
     /// Subscribe to command messages for a device and track the subscription
@@ -329,7 +474,7 @@ impl DevicePublisher {
             client,
             plugin_id: plugin_id.to_string(),
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
-            devices: Arc::new(Mutex::new(HashSet::new())),
+            devices: Arc::new(Mutex::new(DeviceTrackerInner::default())),
         }
     }
 }
@@ -458,7 +603,7 @@ impl PluginClient {
             eventloop,
             config,
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
-            devices: Arc::new(Mutex::new(HashSet::new())),
+            devices: Arc::new(Mutex::new(DeviceTrackerInner::default())),
         })
     }
 
@@ -470,6 +615,20 @@ impl PluginClient {
     /// Return a clone of the underlying MQTT client handle.
     pub fn mqtt_client(&self) -> AsyncClient {
         self.client.clone()
+    }
+
+    /// Enable cross-restart persistence for the device tracker.
+    ///
+    /// Builder-style — call once after `connect`, before any
+    /// `register_device_full` calls. Loads any previously-saved
+    /// device IDs into the in-memory tracker so
+    /// [`DevicePublisher::reconcile_devices`] can clean up devices
+    /// that disappeared while the plugin was offline.
+    ///
+    /// Path is typically `<config_dir>/.published-device-ids.json`.
+    pub fn with_device_persistence(self, path: std::path::PathBuf) -> Self {
+        self.devices.lock().unwrap().enable_persistence(path);
+        self
     }
 
     // ── Full state publishing ────────────────────────────────────────────
@@ -591,7 +750,7 @@ impl PluginClient {
             )
             .await
             .context("register_device failed")?;
-        self.devices.lock().unwrap().insert(device_id.to_string());
+        self.devices.lock().unwrap().insert(device_id);
         info!(device_id, "Device registered");
         Ok(())
     }
@@ -655,7 +814,7 @@ impl PluginClient {
             )
             .await
             .context("register_device_full failed")?;
-        self.devices.lock().unwrap().insert(device_id.to_string());
+        self.devices.lock().unwrap().insert(device_id);
         info!(device_id, "Device registered");
         Ok(())
     }
