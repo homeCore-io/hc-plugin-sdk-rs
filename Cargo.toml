@@ -14,5 +14,5 @@ tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 chrono     = { version = "0.4", features = ["serde"] }
 toml       = "0.8"
-hc-types   = { path = "../../core/crates/hc-types" }
-hc-logging = { path = "../../core/crates/hc-logging" }
+hc-types   = { git = "https://github.com/homeCore-io/homeCore", branch = "main" }
+hc-logging = { git = "https://github.com/homeCore-io/homeCore", branch = "main" }
