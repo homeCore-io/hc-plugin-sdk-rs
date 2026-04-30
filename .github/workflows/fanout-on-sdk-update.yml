@@ -1,0 +1,76 @@
+name: Fan out SDK updates
+
+# When the Rust plugin SDK lands a develop-branch commit that touches
+# library code, dispatch a release build on every dependent plugin
+# repo so their dev container images pick up the new SDK at the same
+# develop SHA. Without this, plugin :dev tags would silently lag the
+# SDK until each plugin's own release was triggered.
+#
+# Triggers:
+#   - push to develop touching src/, Cargo.toml, or Cargo.lock
+#     (skips docs-only changes that wouldn't change behavior)
+#   - workflow_dispatch for ad-hoc fan-out
+#
+# Auth: needs SDK_FANOUT_PAT — a PAT with `actions: write` on each
+# of the 11 plugin repos in the homeCore-io org. Fine-grained PAT
+# preferred. See README for setup.
+
+on:
+  push:
+    branches: [develop]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fanout-sdk
+  cancel-in-progress: true
+
+jobs:
+  fanout:
+    name: Dispatch ${{ matrix.plugin }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin:
+          - hc-hue
+          - hc-yolink
+          - hc-lutron
+          - hc-caseta
+          - hc-sonos
+          - hc-ecowitt
+          - hc-zwave
+          - hc-isy
+          - hc-wled
+          - hc-thermostat
+    env:
+      GH_TOKEN: ${{ secrets.SDK_FANOUT_PAT }}
+    steps:
+      - name: Pre-flight — token + plugin repo reachable
+        run: |
+          if [ -z "${{ secrets.SDK_FANOUT_PAT }}" ]; then
+            echo "::error::SDK_FANOUT_PAT secret is not set in this repo. Add a PAT with actions:write on the 11 plugin repos."
+            exit 1
+          fi
+          gh repo view "homeCore-io/${{ matrix.plugin }}" --json name >/dev/null
+
+      - name: Dispatch release on plugin repo
+        run: |
+          set -eux
+          gh workflow run release.yml \
+            --repo "homeCore-io/${{ matrix.plugin }}" \
+            --ref develop \
+            -F fast=true
+
+      - name: Summary
+        run: |
+          {
+            echo "Dispatched: homeCore-io/${{ matrix.plugin }} release.yml on develop (fast=true)"
+            echo "Triggered by: ${{ github.event_name }} / sha=${{ github.sha }}"
+          } >> "$GITHUB_STEP_SUMMARY"
