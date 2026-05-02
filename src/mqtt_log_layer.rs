@@ -135,6 +135,34 @@ fn tracing_level_to_u8(level: &tracing::Level) -> u8 {
     }
 }
 
+// ── Secret redaction ────────────────────────────────────────────────────────
+
+/// Replacement value emitted for fields whose names match the secret denylist.
+const REDACTED: &str = "<redacted>";
+
+/// Substrings that mark a field as secret. Matched case-insensitively against
+/// the field name. Substring (not whole-word) is intentional so `api_key`,
+/// `bot_token`, `client_secret`, `auth_header`, etc. are all caught.
+///
+/// Convention for plugin authors: pass secrets as named tracing fields rather
+/// than interpolating them into the message string. Only field names go
+/// through this filter — the formatted message is published as-is.
+const SECRET_FIELD_SUBSTRINGS: &[&str] = &[
+    "password",
+    "secret",
+    "token",
+    "key",
+    "psk",
+    "passcode",
+    "credential",
+    "auth",
+];
+
+fn is_secret_field(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SECRET_FIELD_SUBSTRINGS.iter().any(|s| lower.contains(s))
+}
+
 // ── Field visitor ───────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -143,13 +171,27 @@ struct FieldVisitor {
     fields: serde_json::Map<String, serde_json::Value>,
 }
 
+impl FieldVisitor {
+    /// Insert a field, replacing the value with `<redacted>` if the name
+    /// matches the secret denylist. The field is still recorded — only the
+    /// value is masked, so the shape of the log line is preserved.
+    fn insert(&mut self, name: &str, value: serde_json::Value) {
+        let stored = if is_secret_field(name) {
+            serde_json::Value::String(REDACTED.into())
+        } else {
+            value
+        };
+        self.fields.insert(name.to_string(), stored);
+    }
+}
+
 impl tracing::field::Visit for FieldVisitor {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
             self.message = value.to_string();
         } else {
-            self.fields.insert(
-                field.name().to_string(),
+            self.insert(
+                field.name(),
                 serde_json::Value::String(value.to_string()),
             );
         }
@@ -160,34 +202,108 @@ impl tracing::field::Visit for FieldVisitor {
         if field.name() == "message" {
             self.message = s;
         } else {
-            self.fields
-                .insert(field.name().to_string(), serde_json::Value::String(s));
+            self.insert(field.name(), serde_json::Value::String(s));
         }
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        self.fields
-            .insert(field.name().to_string(), serde_json::Value::Bool(value));
+        self.insert(field.name(), serde_json::Value::Bool(value));
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.fields.insert(
-            field.name().to_string(),
-            serde_json::Value::Number(value.into()),
-        );
+        self.insert(field.name(), serde_json::Value::Number(value.into()));
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.fields.insert(
-            field.name().to_string(),
-            serde_json::Value::Number(value.into()),
-        );
+        self.insert(field.name(), serde_json::Value::Number(value.into()));
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
         if let Some(n) = serde_json::Number::from_f64(value) {
-            self.fields
-                .insert(field.name().to_string(), serde_json::Value::Number(n));
+            self.insert(field.name(), serde_json::Value::Number(n));
         }
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_secret_field_matches_denylist() {
+        for name in [
+            "password",
+            "Password",
+            "PASSWORD",
+            "secret",
+            "client_secret",
+            "token",
+            "bot_token",
+            "api_key",
+            "key",
+            "psk",
+            "passcode",
+            "credential",
+            "user_credentials",
+            "auth",
+            "auth_header",
+            "Authorization",
+        ] {
+            assert!(is_secret_field(name), "expected redaction for {name:?}");
+        }
+    }
+
+    #[test]
+    fn is_secret_field_passes_innocuous_names() {
+        for name in ["device_id", "name", "count", "status", "elapsed_ms", "level"] {
+            assert!(
+                !is_secret_field(name),
+                "expected pass-through for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visitor_redacts_string_secret() {
+        let mut v = FieldVisitor::default();
+        v.insert("password", serde_json::Value::String("hunter2".into()));
+        assert_eq!(
+            v.fields.get("password").and_then(|x| x.as_str()),
+            Some(REDACTED)
+        );
+    }
+
+    #[test]
+    fn visitor_redacts_typed_secrets_uniformly() {
+        // Non-string types still get the string `<redacted>` — shape preserved
+        // (field is present, has a value), type intentionally not.
+        let mut v = FieldVisitor::default();
+        v.insert("auth_enabled", serde_json::Value::Bool(true));
+        v.insert("api_key", serde_json::Value::Number(42.into()));
+        assert_eq!(
+            v.fields.get("auth_enabled").and_then(|x| x.as_str()),
+            Some(REDACTED)
+        );
+        assert_eq!(
+            v.fields.get("api_key").and_then(|x| x.as_str()),
+            Some(REDACTED)
+        );
+    }
+
+    #[test]
+    fn visitor_passes_innocuous_fields_through() {
+        let mut v = FieldVisitor::default();
+        v.insert(
+            "device_id",
+            serde_json::Value::String("light.foo".into()),
+        );
+        v.insert("count", serde_json::Value::Number(5.into()));
+        assert_eq!(
+            v.fields.get("device_id").and_then(|x| x.as_str()),
+            Some("light.foo")
+        );
+        assert_eq!(v.fields.get("count").and_then(|x| x.as_i64()), Some(5));
     }
 }

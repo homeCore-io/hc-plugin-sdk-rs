@@ -41,3 +41,23 @@ async fn main() -> anyhow::Result<()> {
 - **State publishing** — full (retained) and partial (merge-patch) with optional provenance metadata
 - **Management protocol** — heartbeat, remote config, dynamic log level
 - **Log forwarding** — `MqttLogLayer` forwards tracing logs to core via MQTT
+
+## Secrets in log fields
+
+`MqttLogLayer` publishes log events to a topic anything can subscribe to,
+so secret values must not leak into them. The layer redacts any field
+whose name (case-insensitive) contains `password`, `secret`, `token`,
+`key`, `psk`, `passcode`, `credential`, or `auth`. Redacted fields are
+still emitted with the same name; only the value becomes `<redacted>`.
+
+**Convention:** pass secrets as named tracing fields, never interpolate
+them into the message string. Only field *names* are filtered — message
+text is published as-is.
+
+```rust
+// Good — value is redacted automatically:
+tracing::info!(api_key = %config.api_key, "Connecting to bridge");
+
+// Bad — message is published verbatim:
+tracing::info!("Connecting with key {}", config.api_key);
+```
