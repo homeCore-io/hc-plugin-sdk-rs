@@ -99,7 +99,7 @@ impl<S: Subscriber> Layer<S> for MqttLogLayer {
         };
 
         if let Ok(payload) = serde_json::to_vec(&line) {
-            let _ = self.client_try_publish(state, payload);
+            self.client_try_publish(state, payload);
         }
     }
 }

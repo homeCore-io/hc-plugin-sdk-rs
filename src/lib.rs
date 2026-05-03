@@ -1093,6 +1093,19 @@ impl PluginClient {
             match self.eventloop.poll().await {
                 Ok(rumqttc::Event::Incoming(Packet::ConnAck(_))) => {
                     info!("Plugin connected to broker");
+                    // Subscribe to the system-wide TZ topic. Retained, so the
+                    // payload arrives within ms of connect; the message
+                    // handler below applies it via `hc_time::init`. Plugin
+                    // tracing init runs before this point, so the very first
+                    // log lines render in UTC and auto-swap once the message
+                    // lands. Use QoS 0 — late delivery is fine.
+                    if let Err(e) = self
+                        .client
+                        .subscribe("homecore/system/tz", QoS::AtMostOnce)
+                        .await
+                    {
+                        warn!(error = %e, "Failed to subscribe homecore/system/tz");
+                    }
                     // Re-subscribe to all tracked topics on every (re)connect.
                     // With clean_session=true, subscriptions are lost on reconnect.
                     let topics: Vec<String> = subs.lock().unwrap().iter().cloned().collect();
@@ -1137,6 +1150,29 @@ impl PluginClient {
                 }
                 Ok(rumqttc::Event::Incoming(Packet::Publish(p))) => {
                     let parts: Vec<&str> = p.topic.split('/').collect();
+
+                    // homecore/system/tz — retained IANA zone name from
+                    // core. Apply via hc_time::init so the tracing
+                    // subscriber's ConfiguredTzTime formatter starts
+                    // emitting in the operator's zone on the next log
+                    // event (no subscriber rebuild needed — hc-time uses
+                    // a RwLock<Tz> updated in place).
+                    if p.topic == "homecore/system/tz" {
+                        match std::str::from_utf8(&p.payload) {
+                            Ok(name) => {
+                                let trimmed = name.trim();
+                                match hc_time::parse_iana(trimmed) {
+                                    Ok(tz) => {
+                                        hc_time::init(tz);
+                                        info!(tz = trimmed, "Applied TZ from homecore/system/tz");
+                                    }
+                                    Err(e) => warn!(payload = trimmed, error = %e, "Bad TZ in homecore/system/tz"),
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "Non-UTF8 homecore/system/tz payload"),
+                        }
+                        continue;
+                    }
 
                     // homecore/devices/{id}/cmd
                     if parts.len() == 4
