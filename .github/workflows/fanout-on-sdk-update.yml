@@ -61,16 +61,27 @@ jobs:
           gh repo view "homeCore-io/${{ matrix.plugin }}" --json name >/dev/null
 
       - name: Dispatch release on plugin repo
+        # refresh_deps=true is the whole point of fanout — without it the
+        # plugin's release rebuilds against whatever SHA the plugin's
+        # Cargo.lock already pins for plugin-sdk-rs, producing a new
+        # container tag that carries the SAME old code. Setting it true
+        # makes `cargo update -p plugin-sdk-rs` run inside the build
+        # container so the SDK SHA we just pushed is the one that
+        # actually lands in the binary. Reproducibility caveat: dev-tag
+        # builds become non-deterministic between fanout runs (expected),
+        # but tag-push releases keep their deterministic Cargo.lock
+        # behavior because they don't go through this dispatcher.
         run: |
           set -eux
           gh workflow run release.yml \
             --repo "homeCore-io/${{ matrix.plugin }}" \
             --ref develop \
-            -F fast=true
+            -F fast=true \
+            -F refresh_deps=true
 
       - name: Summary
         run: |
           {
-            echo "Dispatched: homeCore-io/${{ matrix.plugin }} release.yml on develop (fast=true)"
+            echo "Dispatched: homeCore-io/${{ matrix.plugin }} release.yml on develop (fast=true, refresh_deps=true)"
             echo "Triggered by: ${{ github.event_name }} / sha=${{ github.sha }}"
           } >> "$GITHUB_STEP_SUMMARY"
