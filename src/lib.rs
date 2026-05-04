@@ -945,6 +945,12 @@ impl PluginClient {
                 let payload = serde_json::json!({
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                     "version": hb_version,
+                    // SDK build version — auto-populated from this crate's
+                    // CARGO_PKG_VERSION at compile time. Core's state_bridge
+                    // reads this on first heartbeat per plugin per session
+                    // and warns if MAJOR/MINOR diverge from
+                    // hc-types::PROTOCOL_VERSION. Component versioning Phase B.
+                    "sdk_version": env!("CARGO_PKG_VERSION"),
                     "uptime_secs": uptime_secs,
                     "device_count": device_count,
                 });
