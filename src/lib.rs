@@ -5,9 +5,46 @@
 //!   publish/subscribe helpers, and a command callback loop.
 //! - [`DevicePublisher`] — cloneable handle for publishing state from spawned tasks.
 //! - [`ManagementHandle`] — enable heartbeat + remote config/log management.
+//!
+//! ## Re-exports — single dependency for plugins
+//!
+//! The [`types`] and [`logging`] modules re-export the surface plugins
+//! need from `hc-types` and `hc-logging`. Plugins should consume these
+//! through `plugin-sdk-rs` rather than depending on `hc-types` /
+//! `hc-logging` directly — that keeps the SDK as the single
+//! upstream-homeCore dep, with one SemVer to track and one Cargo.lock
+//! conflict surface to manage. Component versioning plan, Phase C.
+//!
+//! Direct dependencies on `hc-types` / `hc-logging` from existing plugin
+//! repos are still supported (additive change — nothing was renamed or
+//! removed). New plugins should prefer the re-exports; existing ones
+//! migrate as they're touched.
 
 pub mod mqtt_log_layer;
 pub mod streaming;
+
+/// Re-exports of the `hc-types` surface plugins use directly. Plugins
+/// should `use plugin_sdk_rs::types::X;` rather than depending on
+/// `hc-types` directly. Keeps the SDK as the single upstream-homeCore
+/// dep. The whole `hc_types::schema` module is re-exported so plugins
+/// can grow new uses (e.g. `schema::Range`) without an SDK PR per item.
+pub mod types {
+    pub use hc_types::device::{with_command_change_metadata, DeviceChange};
+    pub use hc_types::plugin_capabilities::{
+        Action, Capabilities, Concurrency, ItemOp, RequiresRole,
+    };
+    pub use hc_types::schema;
+    pub use hc_types::schema::{AttributeKind, AttributeSchema, DeviceSchema};
+}
+
+/// Re-exports of `hc-logging` items plugins use directly. Today every
+/// plugin uses [`LogLevelHandle`] in `main.rs` for dynamic log-level
+/// setup; [`with_noise_suppression`] is for the same setup path.
+/// `MqttLogLayer` already lives in this crate (see `mqtt_log_layer`),
+/// so nothing else needs re-exporting.
+pub mod logging {
+    pub use hc_logging::{with_noise_suppression, LogLevelHandle};
+}
 
 use anyhow::{Context, Result};
 use hc_types::device::{change_from_command_payload, with_state_change_metadata, DeviceChange};
