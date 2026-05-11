@@ -85,3 +85,31 @@ jobs:
             echo "Dispatched: homeCore-io/${{ matrix.plugin }} release.yml on develop (fast=true, refresh_deps=true)"
             echo "Triggered by: ${{ github.event_name }} / sha=${{ github.sha }}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Each plugin's release.yml now fires a repository_dispatch at
+  # homeCore-io/docker on success (see hc-scripts/rust-release.yml's
+  # dispatch-appliance job). The docker workflow's concurrency group
+  # coalesces the wave of 10 plugin dispatches into a single appliance
+  # build, so we do NOT need to dispatch the appliance from here.
+  #
+  # We DO still need to dispatch homeCore release, because core uses
+  # hc-types/hc-logging/hc-time (not plugin-sdk-rs) and so isn't in
+  # the plugin matrix above — but hc-types lives in homeCore, and SDK
+  # changes that touch shared traits typically land alongside hc-types
+  # bumps. Triggering core release rebuilds hc-core:dev with the new
+  # workspace state, which then cascades to appliance via dispatch-appliance.
+  dispatch-core:
+    name: Dispatch homeCore release
+    needs: fanout
+    runs-on: ubuntu-latest
+    if: always() && needs.fanout.result != 'cancelled'
+    env:
+      GH_TOKEN: ${{ secrets.SDK_FANOUT_PAT }}
+    steps:
+      - name: Dispatch
+        run: |
+          set -eux
+          gh workflow run release.yml \
+            --repo homeCore-io/homeCore \
+            --ref develop \
+            -F fast=true
