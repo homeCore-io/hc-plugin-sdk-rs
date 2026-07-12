@@ -82,10 +82,35 @@ pub(crate) struct DeviceTrackerInner {
 
 impl DeviceTrackerInner {
     fn enable_persistence(&mut self, path: std::path::PathBuf) {
-        if let Ok(body) = std::fs::read_to_string(&path) {
-            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&body) {
-                self.set.extend(ids);
+        // This snapshot is the only record of devices registered in *earlier*
+        // runs, so it is what lets `reconcile_devices` retire a device that has
+        // since been dropped from config.  If it fails to load we silently lose
+        // that ability and the device lingers in homeCore forever, still
+        // accepting commands nothing will execute — so never fail quietly here.
+        match std::fs::read_to_string(&path) {
+            Ok(body) => match serde_json::from_str::<Vec<String>>(&body) {
+                Ok(ids) => {
+                    debug!(
+                        path = %path.display(),
+                        count = ids.len(),
+                        "Loaded published-device snapshot"
+                    );
+                    self.set.extend(ids);
+                }
+                Err(e) => warn!(
+                    path = %path.display(), error = %e,
+                    "Published-device snapshot is corrupt — devices registered in \
+                     earlier runs cannot be reconciled and will linger in homeCore"
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!(path = %path.display(), "No published-device snapshot yet — first run");
             }
+            Err(e) => warn!(
+                path = %path.display(), error = %e,
+                "Cannot read published-device snapshot — devices registered in earlier \
+                 runs cannot be reconciled and will linger in homeCore"
+            ),
         }
         self.persist_path = Some(path);
     }
