@@ -55,10 +55,28 @@ jobs:
       - name: Pre-flight — token + plugin repo reachable
         run: |
           if [ -z "${{ secrets.SDK_FANOUT_PAT }}" ]; then
-            echo "::error::SDK_FANOUT_PAT secret is not set in this repo. Add a PAT with actions:write on the 11 plugin repos."
+            echo "::error::SDK_FANOUT_PAT is not set in this repo. Add a fine-grained PAT with Actions: read+write and Metadata: read on the 10 plugin repos and homeCore."
             exit 1
           fi
-          gh repo view "homeCore-io/${{ matrix.plugin }}" --json name >/dev/null
+
+          # Report *why* the call failed. This previously fell through to the
+          # "secret is not set" message above, which is the one thing a 401
+          # rules out — the token was present, just expired. That cost real
+          # debugging time; say what actually happened.
+          if ! err=$(gh repo view "homeCore-io/${{ matrix.plugin }}" --json name 2>&1); then
+            case "$err" in
+              *"Bad credentials"*|*"401"*)
+                echo "::error::SDK_FANOUT_PAT is set but GitHub rejected it (401 Bad credentials) — the token is expired or revoked. Rotate it in this repo's Actions secrets."
+                ;;
+              *"Resource not accessible"*|*"403"*|*"Not Found"*|*"404"*)
+                echo "::error::SDK_FANOUT_PAT is valid but cannot reach homeCore-io/${{ matrix.plugin }}. Grant it Actions: read+write and Metadata: read on that repo."
+                ;;
+              *)
+                echo "::error::Pre-flight failed for homeCore-io/${{ matrix.plugin }}: ${err}"
+                ;;
+            esac
+            exit 1
+          fi
 
       - name: Dispatch release on plugin repo
         # refresh_deps=true is the whole point of fanout — without it the
