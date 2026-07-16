@@ -554,6 +554,17 @@ pub struct ManagementHandle {
     /// Capability manifest, published retained on
     /// `homecore/plugins/{id}/capabilities` after the first CONNACK.
     capabilities: Option<hc_types::Capabilities>,
+    /// JSON Schema for the plugin's operator config, injected into the
+    /// published capability manifest as `config_schema`. Core extracts it and
+    /// serves it at `GET /plugins/{id}/config/schema` so the config editor can
+    /// render a typed form. `None` → no schema published (editor uses raw TOML).
+    config_schema: Option<Value>,
+    /// Callback invoked with the plugin's durable learned-state document
+    /// (`homecore/plugins/{id}/state`, retained + owned by core) whenever it
+    /// arrives — once shortly after connect, and again on any core-side change.
+    /// Set via [`ManagementHandle::with_state_handler`]; when present the SDK
+    /// subscribes to that topic on connect.
+    state_handler: Option<Arc<dyn Fn(Value) + Send + Sync>>,
     /// Registered streaming action handlers, indexed by action id.
     streaming_actions: Arc<HashMap<String, StreamingAction>>,
     /// Live streams, keyed by `request_id`. Entries are added on
@@ -590,6 +601,36 @@ impl ManagementHandle {
             caps.plugin_id = self.plugin_id.clone();
         }
         self.capabilities = Some(caps);
+        self
+    }
+
+    /// Declare the JSON Schema of the plugin's operator config. The SDK injects
+    /// it into the published capability manifest as `config_schema`; core serves
+    /// it at `GET /plugins/{id}/config/schema` so the config editor can render a
+    /// typed form instead of a raw textarea.
+    ///
+    /// Requires a capability manifest — the schema rides on it, so call
+    /// [`with_capabilities`](Self::with_capabilities) too (an empty manifest is
+    /// fine). Typically `serde_json::to_value(schemars::schema_for!(MyConfig))`.
+    pub fn with_config_schema(mut self, schema: Value) -> Self {
+        self.config_schema = Some(schema);
+        self
+    }
+
+    /// Register a handler for the plugin's durable learned-state document
+    /// (`homecore/plugins/{id}/state`) — vendor secrets the plugin discovers at
+    /// runtime (Hue `app_key`s, OAuth tokens, published-device-ids), which core
+    /// persists and hands back on connect. The SDK subscribes to the topic and
+    /// invokes `f` with the parsed document each time it arrives (once shortly
+    /// after connect via the retained value, then on any change).
+    ///
+    /// Persist updates with [`PluginClient::persist_state`] /
+    /// [`PluginStateWriter::persist`].
+    pub fn with_state_handler<F>(mut self, f: F) -> Self
+    where
+        F: Fn(Value) + Send + Sync + 'static,
+    {
+        self.state_handler = Some(Arc::new(f));
         self
     }
 
@@ -639,6 +680,29 @@ pub struct PluginClient {
     config: PluginConfig,
     subscriptions: SubscriptionTracker,
     devices: DeviceTracker,
+}
+
+/// Cloneable handle for persisting plugin learned-state deltas without holding
+/// the `PluginClient` (which `run_managed` consumes). Obtain via
+/// [`PluginClient::state_writer`]; safe to move into callbacks.
+#[derive(Clone)]
+pub struct PluginStateWriter {
+    client: AsyncClient,
+    plugin_id: String,
+}
+
+impl PluginStateWriter {
+    /// Publish a learned-state delta to `homecore/plugins/{id}/state/set`
+    /// (non-retained). Core merges it and re-publishes the retained
+    /// authoritative `homecore/plugins/{id}/state`.
+    pub async fn persist(&self, delta: &Value) -> Result<()> {
+        let topic = format!("homecore/plugins/{}/state/set", self.plugin_id);
+        let bytes = serde_json::to_vec(delta).context("serialise state delta")?;
+        self.client
+            .publish(&topic, QoS::AtLeastOnce, false, bytes)
+            .await
+            .with_context(|| format!("publish {topic} failed"))
+    }
 }
 
 impl PluginClient {
@@ -691,6 +755,27 @@ impl PluginClient {
     pub fn with_device_persistence(self, path: std::path::PathBuf) -> Self {
         self.devices.lock().unwrap().enable_persistence(path);
         self
+    }
+
+    // ── Plugin learned-state (D8 write-back) ─────────────────────────────
+
+    /// Persist a learned-state delta to core. Publishes `delta` to
+    /// `homecore/plugins/{id}/state/set`; core shallow-merges it into the
+    /// durable store and re-publishes the authoritative retained
+    /// `homecore/plugins/{id}/state` (delivered to your
+    /// [`ManagementHandle::with_state_handler`]). Top-level keys set to `null`
+    /// are deleted. Not retained — a one-shot write, not a source of truth.
+    pub async fn persist_state(&self, delta: &Value) -> Result<()> {
+        self.state_writer().persist(delta).await
+    }
+
+    /// A cloneable handle for persisting learned state from anywhere — e.g. a
+    /// callback, after `run_managed` has consumed the client by value.
+    pub fn state_writer(&self) -> PluginStateWriter {
+        PluginStateWriter {
+            client: self.client.clone(),
+            plugin_id: self.config.plugin_id.clone(),
+        }
     }
 
     // ── Full state publishing ────────────────────────────────────────────
@@ -1035,6 +1120,8 @@ impl PluginClient {
             log_level_handle,
             custom_handler: None,
             capabilities: None,
+            config_schema: None,
+            state_handler: None,
             streaming_actions: Arc::new(HashMap::new()),
             active_streams: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -1199,19 +1286,33 @@ impl PluginClient {
                         if let Some(ref caps) = mgmt.capabilities {
                             let topic =
                                 format!("homecore/plugins/{}/capabilities", mgmt.plugin_id);
-                            match serde_json::to_vec(caps) {
-                                Ok(bytes) => {
-                                    if let Err(e) = self
-                                        .client
-                                        .publish(&topic, QoS::AtLeastOnce, true, bytes)
-                                        .await
-                                    {
-                                        warn!(error = %e, "Failed to publish capabilities");
-                                    }
+                            // The config schema rides on the manifest JSON (core
+                            // extracts it from the raw payload); the frozen
+                            // `Capabilities` type has no field for it.
+                            let manifest =
+                                build_capability_manifest(caps, mgmt.config_schema.as_ref());
+                            if manifest.is_null() {
+                                warn!("Failed to serialise capabilities");
+                            }
+                            if !manifest.is_null() {
+                                let bytes = serde_json::to_vec(&manifest).unwrap_or_default();
+                                if let Err(e) = self
+                                    .client
+                                    .publish(&topic, QoS::AtLeastOnce, true, bytes)
+                                    .await
+                                {
+                                    warn!(error = %e, "Failed to publish capabilities");
                                 }
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to serialise capabilities");
-                                }
+                            }
+                        }
+
+                        // Learned-state: subscribe to the retained doc core owns.
+                        if mgmt.state_handler.is_some() {
+                            let topic = format!("homecore/plugins/{}/state", mgmt.plugin_id);
+                            if let Err(e) =
+                                self.client.subscribe(&topic, QoS::AtLeastOnce).await
+                            {
+                                warn!(error = %e, "Failed to subscribe plugin state");
                             }
                         }
                     }
@@ -1289,6 +1390,29 @@ impl PluginClient {
                         continue;
                     }
 
+                    // homecore/plugins/{id}/state — durable learned-state doc,
+                    // owned + retained by core. Delivered to the state handler.
+                    if let Some(ref mgmt) = mgmt {
+                        if parts.len() == 4
+                            && parts[0] == "homecore"
+                            && parts[1] == "plugins"
+                            && parts[2] == mgmt.plugin_id
+                            && parts[3] == "state"
+                        {
+                            if let Some(ref handler) = mgmt.state_handler {
+                                // Empty retained payload = core cleared it
+                                // (e.g. on deregister) — nothing to deliver.
+                                if !p.payload.is_empty() {
+                                    match serde_json::from_slice::<Value>(&p.payload) {
+                                        Ok(doc) => handler(doc),
+                                        Err(e) => warn!(topic = %p.topic, error = %e, "Non-JSON plugin state payload"),
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
                     // homecore/plugins/{id}/manage/cmd
                     if let Some(ref mgmt) = mgmt {
                         if parts.len() == 5
@@ -1326,6 +1450,21 @@ impl PluginClient {
                 }
             }
         }
+    }
+}
+
+/// Serialise the capability manifest and inject `config_schema` (which rides on
+/// the manifest JSON, not the frozen `Capabilities` type). Returns `Value::Null`
+/// if `caps` fails to serialise.
+fn build_capability_manifest(caps: &hc_types::Capabilities, config_schema: Option<&Value>) -> Value {
+    match serde_json::to_value(caps) {
+        Ok(mut v) => {
+            if let (Some(obj), Some(schema)) = (v.as_object_mut(), config_schema) {
+                obj.insert("config_schema".into(), schema.clone());
+            }
+            v
+        }
+        Err(_) => Value::Null,
     }
 }
 
@@ -1613,5 +1752,38 @@ fn handle_management_cmd(mgmt: &ManagementHandle, cmd: &Value) -> Value {
                 "error": format!("unknown action: {action}"),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod config_schema_tests {
+    use super::*;
+
+    fn caps() -> hc_types::Capabilities {
+        hc_types::Capabilities {
+            spec: "1".into(),
+            plugin_id: "plugin.hue".into(),
+            actions: vec![],
+        }
+    }
+
+    #[test]
+    fn manifest_injects_config_schema_when_present() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "poll_interval_secs": { "type": "integer" } }
+        });
+        let m = build_capability_manifest(&caps(), Some(&schema));
+        assert_eq!(m["plugin_id"], "plugin.hue");
+        assert_eq!(m["spec"], "1");
+        assert_eq!(m["config_schema"], schema);
+    }
+
+    #[test]
+    fn manifest_omits_config_schema_when_absent() {
+        let m = build_capability_manifest(&caps(), None);
+        assert!(m.get("config_schema").is_none());
+        // Base manifest still intact.
+        assert_eq!(m["plugin_id"], "plugin.hue");
     }
 }
