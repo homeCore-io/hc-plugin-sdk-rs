@@ -692,6 +692,19 @@ pub struct PluginStateWriter {
 }
 
 impl PluginStateWriter {
+    /// Create a `PluginStateWriter` for use in unit tests. The underlying MQTT
+    /// client points at `127.0.0.1:1883` and won't actually send unless a broker
+    /// is running.
+    pub fn test_instance(plugin_id: &str) -> Self {
+        let mut opts = MqttOptions::new(format!("{plugin_id}-state-test"), "127.0.0.1", 1883);
+        opts.set_keep_alive(Duration::from_secs(30));
+        let (client, _eventloop) = AsyncClient::new(opts, 8);
+        Self {
+            client,
+            plugin_id: plugin_id.to_string(),
+        }
+    }
+
     /// Publish a learned-state delta to `homecore/plugins/{id}/state/set`
     /// (non-retained). Core merges it and re-publishes the retained
     /// authoritative `homecore/plugins/{id}/state`.
