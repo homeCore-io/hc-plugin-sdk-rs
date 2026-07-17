@@ -1296,17 +1296,29 @@ impl PluginClient {
                     // Republish capability manifest retained, if declared.
                     // Retained so late-joining core instances still see it.
                     if let Some(ref mgmt) = mgmt {
-                        if let Some(ref caps) = mgmt.capabilities {
+                        // Publish the manifest when the plugin declared capabilities
+                        // OR a config schema — the schema rides on the manifest, so a
+                        // schema-only plugin (no actions) still needs it published.
+                        if mgmt.capabilities.is_some() || mgmt.config_schema.is_some() {
                             let topic =
                                 format!("homecore/plugins/{}/capabilities", mgmt.plugin_id);
+                            // Synthesize an empty manifest for a schema-only plugin.
+                            let synthesized;
+                            let caps = match mgmt.capabilities {
+                                Some(ref c) => c,
+                                None => {
+                                    synthesized = hc_types::Capabilities {
+                                        spec: "1".into(),
+                                        plugin_id: mgmt.plugin_id.clone(),
+                                        actions: Vec::new(),
+                                    };
+                                    &synthesized
+                                }
+                            };
                             // The config schema rides on the manifest JSON (core
-                            // extracts it from the raw payload); the frozen
-                            // `Capabilities` type has no field for it.
+                            // extracts it from the raw payload).
                             let manifest =
                                 build_capability_manifest(caps, mgmt.config_schema.as_ref());
-                            if manifest.is_null() {
-                                warn!("Failed to serialise capabilities");
-                            }
                             if !manifest.is_null() {
                                 let bytes = serde_json::to_vec(&manifest).unwrap_or_default();
                                 if let Err(e) = self
@@ -1316,6 +1328,8 @@ impl PluginClient {
                                 {
                                     warn!(error = %e, "Failed to publish capabilities");
                                 }
+                            } else {
+                                warn!("Failed to serialise capabilities");
                             }
                         }
 
