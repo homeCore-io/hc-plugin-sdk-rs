@@ -731,6 +731,11 @@ impl PluginClient {
         let mut opts = MqttOptions::new(&config.plugin_id, &config.broker_host, config.broker_port);
         opts.set_keep_alive(Duration::from_secs(30));
         opts.set_clean_session(true);
+        // The default max packet size (~10 KB) silently drops a large capability
+        // manifest (rich config schema + actions) at the eventloop — the plugin
+        // stays connected (heartbeats are tiny) but its schema never publishes.
+        // 1 MiB covers any realistic manifest / device payload.
+        opts.set_max_packet_size(1024 * 1024, 1024 * 1024);
         if !config.password.is_empty() {
             opts.set_credentials(&config.plugin_id, &config.password);
         }
