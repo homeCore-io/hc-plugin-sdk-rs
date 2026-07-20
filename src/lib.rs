@@ -559,6 +559,12 @@ pub struct ManagementHandle {
     /// serves it at `GET /plugins/{id}/config/schema` so the config editor can
     /// render a typed form. `None` → no schema published (editor uses raw TOML).
     config_schema: Option<Value>,
+    /// The plugin's own config *descriptor*, injected into the published
+    /// capability manifest as `config_descriptor`. Core serves it at
+    /// `GET /plugins/{id}/config/descriptor`; the editor renders it directly
+    /// instead of guessing a form from the schema. `None` → the client
+    /// auto-derives a baseline descriptor from `config_schema`.
+    config_descriptor: Option<Value>,
     /// Callback invoked with the plugin's durable learned-state document
     /// (`homecore/plugins/{id}/state`, retained + owned by core) whenever it
     /// arrives — once shortly after connect, and again on any core-side change.
@@ -614,6 +620,22 @@ impl ManagementHandle {
     /// fine). Typically `serde_json::to_value(schemars::schema_for!(MyConfig))`.
     pub fn with_config_schema(mut self, schema: Value) -> Self {
         self.config_schema = Some(schema);
+        self
+    }
+
+    /// Declare the plugin's own **config descriptor** — an expressive
+    /// description of its configuration (sections, field kinds, conditionals,
+    /// data sources) that the config editor renders directly, rather than
+    /// guessing a form from the JSON Schema.
+    ///
+    /// Rides on the capability manifest exactly like
+    /// [`with_config_schema`](Self::with_config_schema) (so call
+    /// [`with_capabilities`](Self::with_capabilities) too); core serves it at
+    /// `GET /plugins/{id}/config/descriptor`. Publish the schema as well — the
+    /// schema stays authoritative for *existence* and core-side validation,
+    /// while the descriptor annotates *intent*.
+    pub fn with_config_descriptor(mut self, descriptor: Value) -> Self {
+        self.config_descriptor = Some(descriptor);
         self
     }
 
@@ -1139,6 +1161,7 @@ impl PluginClient {
             custom_handler: None,
             capabilities: None,
             config_schema: None,
+            config_descriptor: None,
             state_handler: None,
             streaming_actions: Arc::new(HashMap::new()),
             active_streams: Arc::new(Mutex::new(HashMap::new())),
@@ -1304,7 +1327,10 @@ impl PluginClient {
                         // Publish the manifest when the plugin declared capabilities
                         // OR a config schema — the schema rides on the manifest, so a
                         // schema-only plugin (no actions) still needs it published.
-                        if mgmt.capabilities.is_some() || mgmt.config_schema.is_some() {
+                        if mgmt.capabilities.is_some()
+                            || mgmt.config_schema.is_some()
+                            || mgmt.config_descriptor.is_some()
+                        {
                             let topic =
                                 format!("homecore/plugins/{}/capabilities", mgmt.plugin_id);
                             // Synthesize an empty manifest for a schema-only plugin.
@@ -1323,7 +1349,11 @@ impl PluginClient {
                             // The config schema rides on the manifest JSON (core
                             // extracts it from the raw payload).
                             let manifest =
-                                build_capability_manifest(caps, mgmt.config_schema.as_ref());
+                                build_capability_manifest(
+                                    caps,
+                                    mgmt.config_schema.as_ref(),
+                                    mgmt.config_descriptor.as_ref(),
+                                );
                             if !manifest.is_null() {
                                 let bytes = serde_json::to_vec(&manifest).unwrap_or_default();
                                 if let Err(e) = self
@@ -1488,11 +1518,20 @@ impl PluginClient {
 /// Serialise the capability manifest and inject `config_schema` (which rides on
 /// the manifest JSON, not the frozen `Capabilities` type). Returns `Value::Null`
 /// if `caps` fails to serialise.
-fn build_capability_manifest(caps: &hc_types::Capabilities, config_schema: Option<&Value>) -> Value {
+fn build_capability_manifest(
+    caps: &hc_types::Capabilities,
+    config_schema: Option<&Value>,
+    config_descriptor: Option<&Value>,
+) -> Value {
     match serde_json::to_value(caps) {
         Ok(mut v) => {
-            if let (Some(obj), Some(schema)) = (v.as_object_mut(), config_schema) {
-                obj.insert("config_schema".into(), schema.clone());
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(schema) = config_schema {
+                    obj.insert("config_schema".into(), schema.clone());
+                }
+                if let Some(descriptor) = config_descriptor {
+                    obj.insert("config_descriptor".into(), descriptor.clone());
+                }
             }
             v
         }
@@ -1805,7 +1844,7 @@ mod config_schema_tests {
             "type": "object",
             "properties": { "poll_interval_secs": { "type": "integer" } }
         });
-        let m = build_capability_manifest(&caps(), Some(&schema));
+        let m = build_capability_manifest(&caps(), Some(&schema), None);
         assert_eq!(m["plugin_id"], "plugin.hue");
         assert_eq!(m["spec"], "1");
         assert_eq!(m["config_schema"], schema);
@@ -1813,7 +1852,7 @@ mod config_schema_tests {
 
     #[test]
     fn manifest_omits_config_schema_when_absent() {
-        let m = build_capability_manifest(&caps(), None);
+        let m = build_capability_manifest(&caps(), None, None);
         assert!(m.get("config_schema").is_none());
         // Base manifest still intact.
         assert_eq!(m["plugin_id"], "plugin.hue");
