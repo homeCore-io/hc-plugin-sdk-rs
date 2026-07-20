@@ -20,6 +20,7 @@
 //! removed). New plugins should prefer the re-exports; existing ones
 //! migrate as they're touched.
 
+pub mod config_descriptor;
 pub mod mqtt_log_layer;
 pub mod streaming;
 
