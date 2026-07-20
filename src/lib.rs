@@ -81,6 +81,30 @@ pub(crate) struct DeviceTrackerInner {
     persist_path: Option<std::path::PathBuf>,
 }
 
+/// Insert `plugin_id` into a device-snapshot filename so two plugins sharing a
+/// config directory cannot share a snapshot:
+/// `.published-device-ids.json` → `.published-device-ids.plugin.hue.json`.
+///
+/// Idempotent: a path that already carries this plugin's id is returned
+/// unchanged, so repeated calls cannot keep extending the name.
+fn scoped_device_snapshot_path(
+    path: &std::path::Path,
+    plugin_id: &str,
+) -> std::path::PathBuf {
+    // Plugin ids contain dots ("plugin.hue"), and so does the base filename, so
+    // work with the full file name rather than Path::file_stem/extension —
+    // otherwise "plugin.hue" would be mistaken for an extension.
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return path.to_path_buf();
+    };
+    let scoped = match name.strip_suffix(".json") {
+        Some(base) if base.ends_with(plugin_id) => name.to_string(),
+        Some(base) => format!("{base}.{plugin_id}.json"),
+        None => format!("{name}.{plugin_id}"),
+    };
+    path.with_file_name(scoped)
+}
+
 impl DeviceTrackerInner {
     fn enable_persistence(&mut self, path: std::path::PathBuf) {
         // This snapshot is the only record of devices registered in *earlier*
@@ -416,9 +440,13 @@ impl DevicePublisher {
     /// `register_device_full` of the session. Multiple calls re-load
     /// from the same path which is harmless but pointless.
     ///
-    /// Path is typically `<config_dir>/.published-device-ids.json`.
+    /// Path is typically `<config_dir>/.published-device-ids.json`. As with
+    /// [`PluginClient::with_device_persistence`], the plugin id is inserted
+    /// into the filename so plugins sharing a config directory cannot share a
+    /// snapshot and unregister each other's devices.
     pub fn enable_persistence(&self, path: std::path::PathBuf) {
-        self.devices.lock().unwrap().enable_persistence(path);
+        let scoped = scoped_device_snapshot_path(&path, &self.plugin_id);
+        self.devices.lock().unwrap().enable_persistence(scoped);
     }
 
     /// Reconcile the live device set against everything this plugin
@@ -792,9 +820,21 @@ impl PluginClient {
     /// [`DevicePublisher::reconcile_devices`] can clean up devices
     /// that disappeared while the plugin was offline.
     ///
-    /// Path is typically `<config_dir>/.published-device-ids.json`.
+    /// Path is typically `<config_dir>/.published-device-ids.json`. The
+    /// **plugin id is inserted into the filename** — the caller does not have
+    /// to, and must not rely on getting back exactly the path it passed.
+    ///
+    /// That scoping is load-bearing, not tidiness. Every plugin derives this
+    /// path as a sibling of its own config file, and a real deployment keeps
+    /// all plugin configs in one directory — so nine plugins were sharing a
+    /// single `.published-device-ids.json`. Each start-up read the previous
+    /// plugin's device ids, concluded they were its own and now stale,
+    /// unregistered them, and wrote the file back containing only its own. The
+    /// plugins deleted each other's devices in a loop, which looked like
+    /// devices randomly disappearing and coming back.
     pub fn with_device_persistence(self, path: std::path::PathBuf) -> Self {
-        self.devices.lock().unwrap().enable_persistence(path);
+        let scoped = scoped_device_snapshot_path(&path, self.plugin_id());
+        self.devices.lock().unwrap().enable_persistence(scoped);
         self
     }
 
@@ -1824,6 +1864,49 @@ fn handle_management_cmd(mgmt: &ManagementHandle, cmd: &Value) -> Value {
                 "error": format!("unknown action: {action}"),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod device_snapshot_path_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The bug this guards: every plugin derives its snapshot path as a sibling
+    /// of its own config, and real deployments keep all plugin configs in one
+    /// directory — so the unscoped name collided and plugins unregistered each
+    /// other's devices.
+    #[test]
+    fn two_plugins_in_one_config_dir_get_different_files() {
+        let shared = Path::new("/config/plugins/.published-device-ids.json");
+        let hue = scoped_device_snapshot_path(shared, "plugin.hue");
+        let sonos = scoped_device_snapshot_path(shared, "plugin.sonos");
+        assert_ne!(hue, sonos);
+        assert_eq!(
+            hue,
+            Path::new("/config/plugins/.published-device-ids.plugin.hue.json")
+        );
+    }
+
+    /// Plugin ids contain dots, so a file_stem/extension implementation would
+    /// treat "hue" as the extension and mangle the name.
+    #[test]
+    fn dotted_plugin_id_is_not_mistaken_for_an_extension() {
+        let p = scoped_device_snapshot_path(
+            Path::new("/c/.published-device-ids.json"),
+            "plugin.hue",
+        );
+        assert_eq!(p.extension().and_then(|e| e.to_str()), Some("json"));
+    }
+
+    #[test]
+    fn scoping_is_idempotent() {
+        let once = scoped_device_snapshot_path(
+            Path::new("/c/.published-device-ids.json"),
+            "plugin.hue",
+        );
+        let twice = scoped_device_snapshot_path(&once, "plugin.hue");
+        assert_eq!(once, twice);
     }
 }
 
