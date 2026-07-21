@@ -483,9 +483,229 @@ impl Field {
     }
 }
 
+/// Config schema leaf paths that the descriptor does **not** cover.
+///
+/// A published descriptor is *authoritative*: the editor renders it instead of
+/// deriving a form from the JSON Schema, so any config field the descriptor
+/// omits becomes uneditable. hc-sonos silently dropped four `logging` settings
+/// that way. This flattens the schema to dotted leaf paths and returns every
+/// leaf that is neither a descriptor field `key` nor in `justified`.
+///
+/// An array **of objects** descends into its item struct, since a table covers
+/// such an array column by column, not wholesale — a missing column is exactly
+/// as uneditable as a missing field. Those leaves are written `devices[].name`
+/// and matched against the table's declared columns; a *manual* table's
+/// `key_by` counts as covered, being row identity rather than an editable cell.
+/// Any other array (`Vec<String>` behind a list editor) stays a single leaf.
+///
+/// A **source-bound** table is deliberately not treated as covering its config
+/// array: its rows come from the live resource and its edits write there, so
+/// the array in this file stays unreachable from the form. Justify those keys
+/// explicitly — that is a real decision about where ownership lives, and worth
+/// stating per plugin rather than inferring.
+///
+/// Intended for a plugin unit test:
+/// ```ignore
+/// assert!(
+///     missing_schema_coverage(&config_schema().unwrap(), &config_descriptor(),
+///                             &["homecore.plugin_id"]).is_empty()
+/// );
+/// ```
+pub fn missing_schema_coverage(
+    schema: &Value,
+    descriptor: &Value,
+    justified: &[&str],
+) -> Vec<String> {
+    let defs = schema
+        .get("definitions")
+        .or_else(|| schema.get("$defs"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // schemars wraps a struct field as `{"allOf": [{"$ref": ...}]}` and a bare
+    // reference as `{"$ref": ...}`. Unwrap either to the definition it names.
+    fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
+        let reference = node.get("$ref").and_then(|r| r.as_str()).or_else(|| {
+            node.get("allOf")
+                .and_then(|a| a.as_array())
+                .filter(|a| a.len() == 1)
+                .and_then(|a| a[0].get("$ref"))
+                .and_then(|r| r.as_str())
+        });
+        if let Some(reference) = reference {
+            if let Some(name) = reference.rsplit('/').next() {
+                if let Some(target) = defs.get(name) {
+                    return target;
+                }
+            }
+        }
+        node
+    }
+
+    fn flatten(node: &Value, defs: &Value, prefix: &str, out: &mut Vec<String>) {
+        let node = resolve(node, defs);
+        let is_object = node.get("type").and_then(|t| t.as_str()) == Some("object")
+            || node.get("properties").is_some();
+        if is_object {
+            if let Some(props) = node.get("properties").and_then(|p| p.as_object()) {
+                for (name, child) in props {
+                    let path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{prefix}.{name}")
+                    };
+                    flatten(child, defs, &path, out);
+                }
+            }
+            return;
+        }
+
+        // An array of objects is covered column by column, so descend into the
+        // item struct under a `[]` prefix. `items` is a single schema for the
+        // homogeneous arrays serde produces; anything else stays a leaf.
+        if node.get("type").and_then(|t| t.as_str()) == Some("array") {
+            if let Some(items) = node.get("items") {
+                let items = resolve(items, defs);
+                if items.get("properties").is_some() {
+                    flatten(items, defs, &format!("{prefix}[]"), out);
+                    return;
+                }
+            }
+        }
+
+        out.push(prefix.to_string());
+    }
+
+    let mut leaves = Vec::new();
+    flatten(schema, &defs, "", &mut leaves);
+
+    let mut keys = std::collections::HashSet::new();
+    if let Some(sections) = descriptor.get("sections").and_then(|s| s.as_array()) {
+        for section in sections {
+            if let Some(fields) = section.get("fields").and_then(|f| f.as_array()) {
+                for field in fields {
+                    let Some(key) = field.get("key").and_then(|k| k.as_str()) else {
+                        continue;
+                    };
+                    keys.insert(key.to_string());
+
+                    // A table's columns cover `key[].column`. `item` is an
+                    // array only for a table; `Field::list` puts its item
+                    // *kind* there as a bare string.
+                    if let Some(columns) = field.get("item").and_then(|i| i.as_array()) {
+                        for column in columns {
+                            if let Some(name) = column.get("key").and_then(|k| k.as_str()) {
+                                keys.insert(format!("{key}[].{name}"));
+                            }
+                        }
+                    }
+                    // Row identity, not an editable cell, but still written.
+                    // Only for a manual table: on a source-bound one `key_by`
+                    // names the *live resource's* item key, which need not be
+                    // a config field at all (hc-wled keys on `device_id` while
+                    // the config row is identified by `hc_id`).
+                    if field.get("source").is_none() {
+                        if let Some(by) = field.get("key_by").and_then(|k| k.as_str()) {
+                            keys.insert(format!("{key}[].{by}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    leaves
+        .into_iter()
+        .filter(|leaf| !keys.contains(leaf) && !justified.contains(&leaf.as_str()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Schema shaped like schemars' output for a struct holding a
+    /// `Vec<DeviceConfig>` and a `Vec<String>`.
+    fn array_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "devices": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/DeviceConfig" }
+                },
+                "hosts": { "type": "array", "items": { "type": "string" } }
+            },
+            "definitions": {
+                "DeviceConfig": {
+                    "type": "object",
+                    "properties": {
+                        "device_id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "fade_secs": { "type": ["number", "null"] }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn table_columns_cover_an_array_of_objects() {
+        let descriptor = Descriptor::new("plugin.x")
+            .section(
+                Section::new("s", "S")
+                    .field(
+                        Field::table("devices")
+                            .columns([Field::text("name"), Field::number("fade_secs")]),
+                    )
+                    .field(Field::list("hosts", "host")),
+            )
+            .build();
+
+        // `device_id` is unlisted, so it surfaces...
+        assert_eq!(
+            missing_schema_coverage(&array_schema(), &descriptor, &[]),
+            vec!["devices[].device_id"]
+        );
+        // ...and is silenced by justifying it, like any other leaf.
+        assert!(
+            missing_schema_coverage(&array_schema(), &descriptor, &["devices[].device_id"])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn key_by_counts_as_covered_and_lists_stay_leaves() {
+        // Same table, but `device_id` is now declared row identity.
+        let descriptor = Descriptor::new("plugin.x")
+            .section(
+                Section::new("s", "S")
+                    .field(
+                        Field::table("devices")
+                            .key_by("device_id")
+                            .columns([Field::text("name"), Field::number("fade_secs")]),
+                    )
+                    .field(Field::list("hosts", "host")),
+            )
+            .build();
+        assert!(missing_schema_coverage(&array_schema(), &descriptor, &[]).is_empty());
+
+        // A `Vec<String>` list is one leaf — dropping its field reports the
+        // array itself, never synthetic `hosts[]` paths.
+        let no_list = Descriptor::new("plugin.x")
+            .section(
+                Section::new("s", "S").field(
+                    Field::table("devices")
+                        .key_by("device_id")
+                        .columns([Field::text("name"), Field::number("fade_secs")]),
+                ),
+            )
+            .build();
+        assert_eq!(
+            missing_schema_coverage(&array_schema(), &no_list, &[]),
+            vec!["hosts"]
+        );
+    }
 
     #[test]
     fn omits_unset_attributes() {
@@ -548,8 +768,46 @@ mod tests {
         assert_eq!(d["plugin_id"], "plugin.example");
         assert_eq!(d["descriptor_version"], 1);
         assert_eq!(d["sections"][0]["id"], "api");
-        assert_eq!(d["sections"][0]["fields"][1]["visible_when"]["field"], "api.enabled");
+        assert_eq!(
+            d["sections"][0]["fields"][1]["visible_when"]["field"],
+            "api.enabled"
+        );
         // `hidden: false` is a default and should not be emitted
         assert!(d["sections"][0].get("hidden").is_none());
+    }
+
+    #[test]
+    fn coverage_flags_omitted_and_respects_justified() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "homecore": { "allOf": [{ "$ref": "#/definitions/Hc" }] },
+                "svc": { "allOf": [{ "$ref": "#/definitions/Svc" }] },
+                "devices": { "type": "array", "items": { "type": "object" } }
+            },
+            "definitions": {
+                "Hc": { "type": "object", "properties": {
+                    "plugin_id": { "type": "string" },
+                    "password": { "type": "string" }
+                }},
+                "Svc": { "type": "object", "properties": {
+                    "host": { "type": "string" },
+                    "port": { "type": "integer" }
+                }}
+            }
+        });
+        // Covers svc.host, devices, homecore.password — omits svc.port, and
+        // homecore.plugin_id is justified.
+        let descriptor = Descriptor::new("plugin.x")
+            .section(
+                Section::new("s", "S")
+                    .field(Field::host("svc.host"))
+                    .field(Field::table("devices"))
+                    .field(Field::secret("homecore.password")),
+            )
+            .build();
+
+        let missing = missing_schema_coverage(&schema, &descriptor, &["homecore.plugin_id"]);
+        assert_eq!(missing, vec!["svc.port".to_string()]);
     }
 }
