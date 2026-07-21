@@ -300,6 +300,12 @@ pub struct Field {
     /// Field keys an action's result may be written into (`import`).
     #[serde(skip_serializing_if = "Option::is_none")]
     targets: Option<Vec<String>>,
+    /// Column a `table` groups its rows under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_by: Option<String>,
+    /// Empty here is worth flagging, though it does not block a save.
+    #[serde(skip_serializing_if = "is_false")]
+    prompt_when_empty: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     visible_when: Option<Cond>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -332,6 +338,8 @@ impl Field {
             text: None,
             action: None,
             targets: None,
+            group_by: None,
+            prompt_when_empty: false,
             visible_when: None,
             required_when: None,
         }
@@ -491,6 +499,28 @@ impl Field {
     /// Which column identifies a `table` row (for reconciliation).
     pub fn key_by(mut self, key: impl Into<String>) -> Self {
         self.key_by = Some(key.into());
+        self
+    }
+
+    /// Group a `table`'s rows under the value of this column.
+    ///
+    /// A long device list is read by where things are, not by the order they
+    /// were added. Rows whose value is empty collect under one "unassigned"
+    /// heading rather than being scattered.
+    pub fn group_by(mut self, key: impl Into<String>) -> Self {
+        self.group_by = Some(key.into());
+        self
+    }
+
+    /// Mark this column as wanting a value, without making it required.
+    ///
+    /// The distinction is real: a Caséta zone imported from an integration
+    /// report has no `kind`, because the report carries no load type. The
+    /// plugin tolerates that — it skips the device and says so — so blocking
+    /// the save would be wrong, but leaving it looking finished would be too.
+    /// The client flags such a row and offers a filter for them.
+    pub fn prompt_when_empty(mut self) -> Self {
+        self.prompt_when_empty = true;
         self
     }
     pub fn source(mut self, source: Source) -> Self {
@@ -783,6 +813,20 @@ mod tests {
         // No key: it edits the target, so it must not count as covering a
         // config leaf of its own.
         assert!(v.get("key").is_none());
+    }
+
+    #[test]
+    fn a_table_can_declare_grouping_and_columns_wanting_a_value() {
+        let v = serde_json::to_value(
+            Field::table("devices")
+                .group_by("area")
+                .columns([Field::select("kind").prompt_when_empty()]),
+        )
+        .unwrap();
+        assert_eq!(v["group_by"], "area");
+        assert_eq!(v["item"][0]["prompt_when_empty"], true);
+        // Wanting a value is not requiring one — the save must still go through.
+        assert!(v["item"][0].get("required").is_none());
     }
 
     #[test]
