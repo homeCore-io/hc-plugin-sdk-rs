@@ -294,6 +294,12 @@ pub struct Field {
     href: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
+    /// Plugin action a field invokes (`import`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    /// Field keys an action's result may be written into (`import`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    targets: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     visible_when: Option<Cond>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -324,6 +330,8 @@ impl Field {
             source: None,
             href: None,
             text: None,
+            action: None,
+            targets: None,
             visible_when: None,
             required_when: None,
         }
@@ -393,6 +401,22 @@ impl Field {
         let mut f = Self::of("link", None);
         f.label = Some(label.into());
         f.href = Some(href.into());
+        f
+    }
+
+    /// A paste-and-parse box: free text handed to the plugin `action`, whose
+    /// returned rows are appended to the tables named by
+    /// [`targets`](Self::targets).
+    ///
+    /// The plugin owns the parsing, because only it knows its vendor's export
+    /// format; the client owns the writing, because config is core-owned. The
+    /// rows land in the form unsaved, so they are reviewed before they persist.
+    ///
+    /// Carries no `key` — it edits the target field, not one of its own, and so
+    /// never counts toward schema coverage.
+    pub fn import(action: impl Into<String>) -> Self {
+        let mut f = Self::of("import", None);
+        f.action = Some(action.into());
         f
     }
 
@@ -471,6 +495,15 @@ impl Field {
     }
     pub fn source(mut self, source: Source) -> Self {
         self.source = Some(source);
+        self
+    }
+    /// Which fields an `import` may write its parsed rows into.
+    ///
+    /// The action returns an object keyed by field name; the client appends
+    /// only the keys listed here, so a misbehaving action cannot reach into
+    /// config the descriptor never offered it.
+    pub fn targets<S: Into<String>>(mut self, keys: impl IntoIterator<Item = S>) -> Self {
+        self.targets = Some(keys.into_iter().map(Into::into).collect());
         self
     }
     pub fn visible_when(mut self, cond: Cond) -> Self {
@@ -733,6 +766,23 @@ mod tests {
         assert!(table["item"].is_array());
         assert_eq!(table["item"][0]["key"], "name");
         assert_eq!(table["key_by"], "device_id");
+    }
+
+    #[test]
+    fn import_carries_its_action_and_target_but_no_key() {
+        let v = serde_json::to_value(
+            Field::import("import_report")
+                .label("Bulk import")
+                .targets(["devices", "scenes"]),
+        )
+        .unwrap();
+        assert_eq!(v["kind"], "import");
+        assert_eq!(v["action"], "import_report");
+        assert_eq!(v["targets"][0], "devices");
+        assert_eq!(v["targets"][1], "scenes");
+        // No key: it edits the target, so it must not count as covering a
+        // config leaf of its own.
+        assert!(v.get("key").is_none());
     }
 
     #[test]
