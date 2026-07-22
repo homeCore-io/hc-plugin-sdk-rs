@@ -87,10 +87,7 @@ pub(crate) struct DeviceTrackerInner {
 ///
 /// Idempotent: a path that already carries this plugin's id is returned
 /// unchanged, so repeated calls cannot keep extending the name.
-fn scoped_device_snapshot_path(
-    path: &std::path::Path,
-    plugin_id: &str,
-) -> std::path::PathBuf {
+fn scoped_device_snapshot_path(path: &std::path::Path, plugin_id: &str) -> std::path::PathBuf {
     // Plugin ids contain dots ("plugin.hue"), and so does the base filename, so
     // work with the full file name rather than Path::file_stem/extension —
     // otherwise "plugin.hue" would be mistaken for an extension.
@@ -470,10 +467,7 @@ impl DevicePublisher {
     /// are reported in `unknown_in_live` but otherwise ignored — call
     /// `register_device_full` for them first to bring them into the
     /// tracker.
-    pub async fn reconcile_devices(
-        &self,
-        live: HashSet<String>,
-    ) -> Result<ReconcileReport> {
+    pub async fn reconcile_devices(&self, live: HashSet<String>) -> Result<ReconcileReport> {
         let known = self.devices.lock().unwrap().snapshot();
         let stale: Vec<String> = known.difference(&live).cloned().collect();
         let unknown_in_live: Vec<String> = live.difference(&known).cloned().collect();
@@ -693,8 +687,7 @@ impl ManagementHandle {
     /// stage before returning.
     pub fn with_streaming_action(mut self, action: StreamingAction) -> Self {
         // Arc<HashMap<_,_>> is immutable after clone; rebuild on add.
-        let mut map: HashMap<String, StreamingAction> =
-            (*self.streaming_actions).clone();
+        let mut map: HashMap<String, StreamingAction> = (*self.streaming_actions).clone();
         map.insert(action.id.clone(), action);
         self.streaming_actions = Arc::new(map);
         self
@@ -1372,8 +1365,7 @@ impl PluginClient {
                             || mgmt.config_schema.is_some()
                             || mgmt.config_descriptor.is_some()
                         {
-                            let topic =
-                                format!("homecore/plugins/{}/capabilities", mgmt.plugin_id);
+                            let topic = format!("homecore/plugins/{}/capabilities", mgmt.plugin_id);
                             // Synthesize an empty manifest for a schema-only plugin.
                             let synthesized;
                             let caps = match mgmt.capabilities {
@@ -1389,12 +1381,11 @@ impl PluginClient {
                             };
                             // The config schema rides on the manifest JSON (core
                             // extracts it from the raw payload).
-                            let manifest =
-                                build_capability_manifest(
-                                    caps,
-                                    mgmt.config_schema.as_ref(),
-                                    mgmt.config_descriptor.as_ref(),
-                                );
+                            let manifest = build_capability_manifest(
+                                caps,
+                                mgmt.config_schema.as_ref(),
+                                mgmt.config_descriptor.as_ref(),
+                            );
                             if !manifest.is_null() {
                                 let bytes = serde_json::to_vec(&manifest).unwrap_or_default();
                                 if let Err(e) = self
@@ -1412,9 +1403,7 @@ impl PluginClient {
                         // Learned-state: subscribe to the retained doc core owns.
                         if mgmt.state_handler.is_some() {
                             let topic = format!("homecore/plugins/{}/state", mgmt.plugin_id);
-                            if let Err(e) =
-                                self.client.subscribe(&topic, QoS::AtLeastOnce).await
-                            {
+                            if let Err(e) = self.client.subscribe(&topic, QoS::AtLeastOnce).await {
                                 warn!(error = %e, "Failed to subscribe plugin state");
                             }
                         }
@@ -1438,7 +1427,9 @@ impl PluginClient {
                                         hc_time::init(tz);
                                         info!(tz = trimmed, "Applied TZ from homecore/system/tz");
                                     }
-                                    Err(e) => warn!(payload = trimmed, error = %e, "Bad TZ in homecore/system/tz"),
+                                    Err(e) => {
+                                        warn!(payload = trimmed, error = %e, "Bad TZ in homecore/system/tz")
+                                    }
                                 }
                             }
                             Err(e) => warn!(error = %e, "Non-UTF8 homecore/system/tz payload"),
@@ -1508,7 +1499,9 @@ impl PluginClient {
                                 if !p.payload.is_empty() {
                                     match serde_json::from_slice::<Value>(&p.payload) {
                                         Ok(doc) => handler(doc),
-                                        Err(e) => warn!(topic = %p.topic, error = %e, "Non-JSON plugin state payload"),
+                                        Err(e) => {
+                                            warn!(topic = %p.topic, error = %e, "Non-JSON plugin state payload")
+                                        }
                                     }
                                 }
                             }
@@ -1525,12 +1518,7 @@ impl PluginClient {
                             && parts[4] == "cmd"
                         {
                             if let Ok(cmd) = serde_json::from_slice::<Value>(&p.payload) {
-                                let resp = dispatch_management_cmd(
-                                    mgmt,
-                                    &self.client,
-                                    &cmd,
-                                )
-                                .await;
+                                let resp = dispatch_management_cmd(mgmt, &self.client, &cmd).await;
                                 let resp_topic =
                                     format!("homecore/plugins/{}/manage/response", mgmt.plugin_id);
                                 let _ = self
@@ -1603,7 +1591,9 @@ async fn dispatch_management_cmd(
         let found = {
             let map = mgmt.active_streams.lock().unwrap();
             if let Some(entry) = map.get(target) {
-                entry.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                entry
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 true
             } else {
                 false
@@ -1892,19 +1882,15 @@ mod device_snapshot_path_tests {
     /// treat "hue" as the extension and mangle the name.
     #[test]
     fn dotted_plugin_id_is_not_mistaken_for_an_extension() {
-        let p = scoped_device_snapshot_path(
-            Path::new("/c/.published-device-ids.json"),
-            "plugin.hue",
-        );
+        let p =
+            scoped_device_snapshot_path(Path::new("/c/.published-device-ids.json"), "plugin.hue");
         assert_eq!(p.extension().and_then(|e| e.to_str()), Some("json"));
     }
 
     #[test]
     fn scoping_is_idempotent() {
-        let once = scoped_device_snapshot_path(
-            Path::new("/c/.published-device-ids.json"),
-            "plugin.hue",
-        );
+        let once =
+            scoped_device_snapshot_path(Path::new("/c/.published-device-ids.json"), "plugin.hue");
         let twice = scoped_device_snapshot_path(&once, "plugin.hue");
         assert_eq!(once, twice);
     }

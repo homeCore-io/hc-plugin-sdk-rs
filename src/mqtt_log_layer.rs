@@ -190,10 +190,7 @@ impl tracing::field::Visit for FieldVisitor {
         if field.name() == "message" {
             self.message = value.to_string();
         } else {
-            self.insert(
-                field.name(),
-                serde_json::Value::String(value.to_string()),
-            );
+            self.insert(field.name(), serde_json::Value::String(value.to_string()));
         }
     }
 
@@ -257,11 +254,15 @@ mod tests {
 
     #[test]
     fn is_secret_field_passes_innocuous_names() {
-        for name in ["device_id", "name", "count", "status", "elapsed_ms", "level"] {
-            assert!(
-                !is_secret_field(name),
-                "expected pass-through for {name:?}"
-            );
+        for name in [
+            "device_id",
+            "name",
+            "count",
+            "status",
+            "elapsed_ms",
+            "level",
+        ] {
+            assert!(!is_secret_field(name), "expected pass-through for {name:?}");
         }
     }
 
@@ -295,10 +296,7 @@ mod tests {
     #[test]
     fn visitor_passes_innocuous_fields_through() {
         let mut v = FieldVisitor::default();
-        v.insert(
-            "device_id",
-            serde_json::Value::String("light.foo".into()),
-        );
+        v.insert("device_id", serde_json::Value::String("light.foo".into()));
         v.insert("count", serde_json::Value::Number(5.into()));
         assert_eq!(
             v.fields.get("device_id").and_then(|x| x.as_str()),
