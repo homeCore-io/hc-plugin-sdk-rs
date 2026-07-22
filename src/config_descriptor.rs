@@ -83,6 +83,15 @@ pub struct Section {
     /// Editable but kept out of the rail (bootstrap/connection plumbing).
     #[serde(skip_serializing_if = "is_false")]
     hidden: bool,
+    /// Show this section only when the condition holds.
+    ///
+    /// Distinct from `hidden`, which is unconditional. This is for sections
+    /// that only *apply* in some configurations — YoLink's cloud credentials
+    /// when the hub is local, say. Putting the condition on every field
+    /// instead would leave a titled, empty section and a rail entry that
+    /// leads nowhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visible_when: Option<Cond>,
     fields: Vec<Field>,
 }
 
@@ -94,8 +103,15 @@ impl Section {
             icon: None,
             help: None,
             hidden: false,
+            visible_when: None,
             fields: Vec::new(),
         }
+    }
+
+    /// Show this section only while `cond` holds. See the field docs above.
+    pub fn visible_when(mut self, cond: Cond) -> Self {
+        self.visible_when = Some(cond);
+        self
     }
 
     pub fn icon(mut self, icon: impl Into<String>) -> Self {
@@ -588,13 +604,38 @@ pub fn missing_schema_coverage(
     // schemars wraps a struct field as `{"allOf": [{"$ref": ...}]}` and a bare
     // reference as `{"$ref": ...}`. Unwrap either to the definition it names.
     fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
-        let reference = node.get("$ref").and_then(|r| r.as_str()).or_else(|| {
-            node.get("allOf")
-                .and_then(|a| a.as_array())
-                .filter(|a| a.len() == 1)
-                .and_then(|a| a[0].get("$ref"))
-                .and_then(|r| r.as_str())
-        });
+        let reference = node
+            .get("$ref")
+            .and_then(|r| r.as_str())
+            .or_else(|| {
+                node.get("allOf")
+                    .and_then(|a| a.as_array())
+                    .filter(|a| a.len() == 1)
+                    .and_then(|a| a[0].get("$ref"))
+                    .and_then(|r| r.as_str())
+            })
+            // `Option<SomeStruct>` becomes `anyOf: [{$ref}, {type: "null"}]`.
+            // Without unwrapping that to its one real variant, an optional
+            // nested struct looks like a scalar leaf, and the whole subtree
+            // below it goes unchecked — hc-yolink's `cloud` and `local`
+            // credential blocks are exactly this shape.
+            .or_else(|| {
+                for key in ["anyOf", "oneOf"] {
+                    let Some(variants) = node.get(key).and_then(|a| a.as_array()) else {
+                        continue;
+                    };
+                    let mut real = variants
+                        .iter()
+                        .filter(|v| v.get("type").and_then(|t| t.as_str()) != Some("null"));
+                    let (Some(only), None) = (real.next(), real.next()) else {
+                        continue;
+                    };
+                    if let Some(reference) = only.get("$ref").and_then(|r| r.as_str()) {
+                        return Some(reference);
+                    }
+                }
+                None
+            });
         if let Some(reference) = reference {
             if let Some(name) = reference.rsplit('/').next() {
                 if let Some(target) = defs.get(name) {
@@ -903,5 +944,87 @@ mod tests {
 
         let missing = missing_schema_coverage(&schema, &descriptor, &["homecore.plugin_id"]);
         assert_eq!(missing, vec!["svc.port".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod optional_struct_and_section_tests {
+    use super::*;
+
+    /// `Option<CloudConfig>` as schemars emits it: an `anyOf` of the real
+    /// definition and a null.
+    fn optional_struct_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "yolink": {
+                    "type": "object",
+                    "properties": {
+                        "cloud": {
+                            "anyOf": [
+                                { "$ref": "#/definitions/CloudConfig" },
+                                { "type": "null" }
+                            ]
+                        }
+                    }
+                }
+            },
+            "definitions": {
+                "CloudConfig": {
+                    "type": "object",
+                    "properties": {
+                        "uaid": { "type": "string" },
+                        "secret_key": { "type": "string" }
+                    }
+                }
+            }
+        })
+    }
+
+    /// An optional nested struct must be descended into, not treated as one
+    /// opaque leaf. Before this, declaring `yolink.cloud.uaid` still reported
+    /// `yolink.cloud` missing, and — worse — a descriptor that covered
+    /// *nothing* inside the struct passed by naming the parent.
+    #[test]
+    fn optional_nested_struct_is_checked_field_by_field() {
+        let covers_children = Descriptor::new("plugin.yolink")
+            .section(
+                Section::new("cloud", "Cloud")
+                    .field(Field::text("yolink.cloud.uaid"))
+                    .field(Field::secret("yolink.cloud.secret_key")),
+            )
+            .build();
+        assert!(
+            missing_schema_coverage(&optional_struct_schema(), &covers_children, &[]).is_empty(),
+            "declaring every field inside the optional struct should satisfy it"
+        );
+
+        let covers_only_parent = Descriptor::new("plugin.yolink")
+            .section(Section::new("cloud", "Cloud").field(Field::text("yolink.cloud")))
+            .build();
+        assert_eq!(
+            missing_schema_coverage(&optional_struct_schema(), &covers_only_parent, &[]),
+            vec![
+                "yolink.cloud.secret_key".to_string(),
+                "yolink.cloud.uaid".to_string()
+            ],
+            "naming the parent must not pass off the whole subtree as covered"
+        );
+    }
+
+    /// A conditional section carries its condition on the wire; an ordinary
+    /// one stays absent rather than serialising a null.
+    #[test]
+    fn section_visibility_is_serialised_only_when_set() {
+        let d = Descriptor::new("plugin.yolink")
+            .section(Section::new("cloud", "Cloud").visible_when(Cond::eq("yolink.mode", "cloud")))
+            .section(Section::new("logging", "Logging"))
+            .build();
+        let sections = d["sections"].as_array().expect("sections");
+        assert_eq!(
+            sections[0]["visible_when"],
+            serde_json::json!({ "field": "yolink.mode", "eq": "cloud" })
+        );
+        assert!(sections[1].get("visible_when").is_none());
     }
 }
