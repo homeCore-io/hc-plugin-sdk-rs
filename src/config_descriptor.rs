@@ -177,6 +177,8 @@ pub struct Source {
     item_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     labels: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability: Option<String>,
 }
 
 impl Source {
@@ -187,6 +189,7 @@ impl Source {
             reference: reference.into(),
             item_key: None,
             labels: None,
+            capability: None,
         }
     }
 
@@ -197,12 +200,31 @@ impl Source {
             reference: reference.into(),
             item_key: None,
             labels: None,
+            capability: None,
         }
     }
 
     /// Which property identifies a row.
     pub fn item_key(mut self, key: impl Into<String>) -> Self {
         self.item_key = Some(key.into());
+        self
+    }
+
+    /// Narrow a device source to devices that can actually do the job.
+    ///
+    /// Offering every device in the house and trusting the operator to know
+    /// which ones apply is how a thermostat ends up averaging a light bulb.
+    /// The client resolves these against what each device actually publishes,
+    /// because `supported_actions` is not published by every plugin:
+    ///
+    /// - `temperature` — reports a `temperature` attribute. Devices naming the
+    ///   reading something else are excluded, which is the point: the reading
+    ///   is then known and needs no separate "which attribute" field.
+    /// - `switch` — binary on/off. Carries `on` but no brightness, so dimmers
+    ///   and lamps are excluded; the on/off payload is then implied by the
+    ///   Binary Switch convention rather than typed out.
+    pub fn capability(mut self, capability: impl Into<String>) -> Self {
+        self.capability = Some(capability.into());
         self
     }
 
@@ -322,6 +344,9 @@ pub struct Field {
     /// Empty here is worth flagging, though it does not block a save.
     #[serde(skip_serializing_if = "is_false")]
     prompt_when_empty: bool,
+    /// The client mints this value; it is never shown or typed.
+    #[serde(skip_serializing_if = "is_false")]
+    generated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     visible_when: Option<Cond>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -356,6 +381,7 @@ impl Field {
             targets: None,
             group_by: None,
             prompt_when_empty: false,
+            generated: false,
             visible_when: None,
             required_when: None,
         }
@@ -539,6 +565,24 @@ impl Field {
         self.prompt_when_empty = true;
         self
     }
+    /// The client generates this value when the row is created, and never
+    /// renders a control for it.
+    ///
+    /// For identity an operator should not be inventing. A thermostat's `id`
+    /// becomes the device id `thermostat_<id>`, which sounds like something
+    /// worth choosing until you notice nobody ever types it: core assigns every
+    /// device a canonical name from its area and display name
+    /// (`hallway.upstairs`), and the rule resolver accepts that, so asking for
+    /// an id only invites a second identifier that must never change.
+    ///
+    /// Implies read-only, and must not be combined with `prompt_when_empty` —
+    /// a generated value is never empty, and flagging it would ask the operator
+    /// to fix something they cannot see.
+    pub fn generated(mut self) -> Self {
+        self.generated = true;
+        self
+    }
+
     pub fn source(mut self, source: Source) -> Self {
         self.source = Some(source);
         self
