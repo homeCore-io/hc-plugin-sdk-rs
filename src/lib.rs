@@ -21,6 +21,7 @@
 //! migrate as they're touched.
 
 pub mod config_descriptor;
+pub mod device_actions;
 pub mod mqtt_log_layer;
 pub mod streaming;
 
@@ -328,6 +329,29 @@ impl DevicePublisher {
             .publish(&topic, QoS::AtLeastOnce, true, payload)
             .await
             .context("register_device_schema failed")
+    }
+
+    /// Publish a device capability schema built as JSON.
+    ///
+    /// The route for a schema carrying **action declarations** — see
+    /// [`device_actions::with_actions`](crate::device_actions::with_actions).
+    /// Deliberately separate from [`Self::register_device_schema`]: the typed
+    /// `DeviceSchema` this SDK compiles against is whatever `hc-types` on
+    /// `main` says it is, so a plugin declaring actions would otherwise wait on
+    /// a core release, an SDK repin and a plugin repin before it could say
+    /// anything new. The `Value` costs compile-time checking of the shape,
+    /// which the builders give back.
+    pub async fn register_device_schema_json(
+        &self,
+        device_id: &str,
+        schema: &Value,
+    ) -> Result<()> {
+        let topic = format!("homecore/devices/{device_id}/schema");
+        let payload = serde_json::to_vec(schema).context("serialising device schema")?;
+        self.client
+            .publish(&topic, QoS::AtLeastOnce, true, payload)
+            .await
+            .context("register_device_schema_json failed")
     }
 
     // ── Unregister ───────────────────────────────────────────────────────
@@ -1055,6 +1079,29 @@ impl PluginClient {
             .publish(&topic, QoS::AtLeastOnce, true, payload)
             .await
             .context("register_device_schema failed")
+    }
+
+    /// Publish a device capability schema built as JSON.
+    ///
+    /// The route for a schema carrying **action declarations** — see
+    /// [`device_actions::with_actions`](crate::device_actions::with_actions).
+    /// Deliberately separate from [`Self::register_device_schema`]: the typed
+    /// `DeviceSchema` this SDK compiles against is whatever `hc-types` on
+    /// `main` says it is, so a plugin declaring actions would otherwise wait on
+    /// a core release, an SDK repin and a plugin repin before it could say
+    /// anything new. The `Value` costs compile-time checking of the shape,
+    /// which the builders give back.
+    pub async fn register_device_schema_json(
+        &self,
+        device_id: &str,
+        schema: &Value,
+    ) -> Result<()> {
+        let topic = format!("homecore/devices/{device_id}/schema");
+        let payload = serde_json::to_vec(schema).context("serialising device schema")?;
+        self.client
+            .publish(&topic, QoS::AtLeastOnce, true, payload)
+            .await
+            .context("register_device_schema_json failed")
     }
 
     // ── Unregister ───────────────────────────────────────────────────────
