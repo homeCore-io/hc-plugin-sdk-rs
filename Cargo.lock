@@ -219,7 +219,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -340,7 +340,7 @@ checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 [[package]]
 name = "hc-logging"
 version = "0.1.4"
-source = "git+https://github.com/homeCore-io/homeCore?branch=main#3f6b829b8d37d9d2cfcb78a00e129aabe426dd47"
+source = "git+https://github.com/homeCore-io/homeCore?branch=main#9412ff37e6313bf21e11dc7a23240d6cfe33be49"
 dependencies = [
  "anyhow",
  "chrono",
@@ -358,7 +358,7 @@ dependencies = [
 [[package]]
 name = "hc-time"
 version = "0.1.4"
-source = "git+https://github.com/homeCore-io/homeCore?branch=main#3f6b829b8d37d9d2cfcb78a00e129aabe426dd47"
+source = "git+https://github.com/homeCore-io/homeCore?branch=main#9412ff37e6313bf21e11dc7a23240d6cfe33be49"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -368,7 +368,7 @@ dependencies = [
 [[package]]
 name = "hc-types"
 version = "0.1.4"
-source = "git+https://github.com/homeCore-io/homeCore?branch=main#3f6b829b8d37d9d2cfcb78a00e129aabe426dd47"
+source = "git+https://github.com/homeCore-io/homeCore?branch=main#9412ff37e6313bf21e11dc7a23240d6cfe33be49"
 dependencies = [
  "chrono",
  "ron",
@@ -643,7 +643,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plugin-sdk-rs"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "chrono",
