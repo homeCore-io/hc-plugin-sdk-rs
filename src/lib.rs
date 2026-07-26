@@ -36,7 +36,9 @@ pub mod types {
         Action, Capabilities, Concurrency, ItemOp, RequiresRole,
     };
     pub use hc_types::schema;
-    pub use hc_types::schema::{AttributeKind, AttributeSchema, DeviceSchema};
+    pub use hc_types::schema::{
+        AttributeKind, AttributeSchema, BoolStates, DeviceSchema, StateLabel,
+    };
 }
 
 /// Re-exports of `hc-logging` items plugins use directly. Today every
