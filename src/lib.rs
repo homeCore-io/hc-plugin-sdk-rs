@@ -350,11 +350,7 @@ impl DevicePublisher {
     /// a core release, an SDK repin and a plugin repin before it could say
     /// anything new. The `Value` costs compile-time checking of the shape,
     /// which the builders give back.
-    pub async fn register_device_schema_json(
-        &self,
-        device_id: &str,
-        schema: &Value,
-    ) -> Result<()> {
+    pub async fn register_device_schema_json(&self, device_id: &str, schema: &Value) -> Result<()> {
         let topic = format!("homecore/devices/{device_id}/schema");
         let payload = serde_json::to_vec(schema).context("serialising device schema")?;
         self.client
@@ -597,6 +593,10 @@ impl DevicePublisher {
     }
 }
 
+/// Boxed handler for management actions the built-in dispatcher does not
+/// recognise. Installed via [`ManagementHandle::with_custom_handler`].
+type CustomActionHandler = Arc<dyn Fn(&Value) -> Option<Value> + Send + Sync>;
+
 /// Handle returned by [`PluginClient::enable_management`].
 ///
 /// Pass this to [`PluginClient::run_managed`] to automatically handle
@@ -606,7 +606,7 @@ pub struct ManagementHandle {
     plugin_id: String,
     config_path: Option<String>,
     log_level_handle: Option<hc_logging::LogLevelHandle>,
-    custom_handler: Option<Arc<dyn Fn(&Value) -> Option<Value> + Send + Sync>>,
+    custom_handler: Option<CustomActionHandler>,
     /// Capability manifest, published retained on
     /// `homecore/plugins/{id}/capabilities` after the first CONNACK.
     capabilities: Option<hc_types::Capabilities>,
@@ -1100,11 +1100,7 @@ impl PluginClient {
     /// a core release, an SDK repin and a plugin repin before it could say
     /// anything new. The `Value` costs compile-time checking of the shape,
     /// which the builders give back.
-    pub async fn register_device_schema_json(
-        &self,
-        device_id: &str,
-        schema: &Value,
-    ) -> Result<()> {
+    pub async fn register_device_schema_json(&self, device_id: &str, schema: &Value) -> Result<()> {
         let topic = format!("homecore/devices/{device_id}/schema");
         let payload = serde_json::to_vec(schema).context("serialising device schema")?;
         self.client
