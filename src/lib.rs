@@ -20,7 +20,14 @@
 //! removed). New plugins should prefer the re-exports; existing ones
 //! migrate as they're touched.
 
-pub mod config_descriptor;
+/// Typed authoring for a plugin's config descriptor. The vocabulary lives in
+/// `hc-types` because core describes `homecore.toml` with the same builders and
+/// checks it with the same [`missing_schema_coverage`](hc_types::config_descriptor::missing_schema_coverage)
+/// rule; core cannot depend on this crate without a cycle. Re-exported
+/// unchanged, so `plugin_sdk_rs::config_descriptor::*` keeps working and no
+/// plugin source changes.
+pub use hc_types::config_descriptor;
+
 pub mod device_actions;
 pub mod mqtt_log_layer;
 pub mod streaming;
