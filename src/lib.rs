@@ -20,6 +20,15 @@
 //! removed). New plugins should prefer the re-exports; existing ones
 //! migrate as they're touched.
 
+/// Typed authoring for a plugin's config descriptor. The vocabulary lives in
+/// `hc-types` because core describes `homecore.toml` with the same builders and
+/// checks it with the same [`missing_schema_coverage`](hc_types::config_descriptor::missing_schema_coverage)
+/// rule; core cannot depend on this crate without a cycle. Re-exported
+/// unchanged, so `plugin_sdk_rs::config_descriptor::*` keeps working and no
+/// plugin source changes.
+pub use hc_types::config_descriptor;
+
+pub mod device_actions;
 pub mod mqtt_log_layer;
 pub mod streaming;
 
@@ -34,7 +43,9 @@ pub mod types {
         Action, Capabilities, Concurrency, ItemOp, RequiresRole,
     };
     pub use hc_types::schema;
-    pub use hc_types::schema::{AttributeKind, AttributeSchema, DeviceSchema};
+    pub use hc_types::schema::{
+        AttributeKind, AttributeSchema, BoolStates, DeviceSchema, StateLabel,
+    };
 }
 
 /// Re-exports of `hc-logging` items plugins use directly. Today every
@@ -80,12 +91,58 @@ pub(crate) struct DeviceTrackerInner {
     persist_path: Option<std::path::PathBuf>,
 }
 
+/// Insert `plugin_id` into a device-snapshot filename so two plugins sharing a
+/// config directory cannot share a snapshot:
+/// `.published-device-ids.json` → `.published-device-ids.plugin.hue.json`.
+///
+/// Idempotent: a path that already carries this plugin's id is returned
+/// unchanged, so repeated calls cannot keep extending the name.
+fn scoped_device_snapshot_path(path: &std::path::Path, plugin_id: &str) -> std::path::PathBuf {
+    // Plugin ids contain dots ("plugin.hue"), and so does the base filename, so
+    // work with the full file name rather than Path::file_stem/extension —
+    // otherwise "plugin.hue" would be mistaken for an extension.
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return path.to_path_buf();
+    };
+    let scoped = match name.strip_suffix(".json") {
+        Some(base) if base.ends_with(plugin_id) => name.to_string(),
+        Some(base) => format!("{base}.{plugin_id}.json"),
+        None => format!("{name}.{plugin_id}"),
+    };
+    path.with_file_name(scoped)
+}
+
 impl DeviceTrackerInner {
     fn enable_persistence(&mut self, path: std::path::PathBuf) {
-        if let Ok(body) = std::fs::read_to_string(&path) {
-            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&body) {
-                self.set.extend(ids);
+        // This snapshot is the only record of devices registered in *earlier*
+        // runs, so it is what lets `reconcile_devices` retire a device that has
+        // since been dropped from config.  If it fails to load we silently lose
+        // that ability and the device lingers in homeCore forever, still
+        // accepting commands nothing will execute — so never fail quietly here.
+        match std::fs::read_to_string(&path) {
+            Ok(body) => match serde_json::from_str::<Vec<String>>(&body) {
+                Ok(ids) => {
+                    debug!(
+                        path = %path.display(),
+                        count = ids.len(),
+                        "Loaded published-device snapshot"
+                    );
+                    self.set.extend(ids);
+                }
+                Err(e) => warn!(
+                    path = %path.display(), error = %e,
+                    "Published-device snapshot is corrupt — devices registered in \
+                     earlier runs cannot be reconciled and will linger in homeCore"
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!(path = %path.display(), "No published-device snapshot yet — first run");
             }
+            Err(e) => warn!(
+                path = %path.display(), error = %e,
+                "Cannot read published-device snapshot — devices registered in earlier \
+                 runs cannot be reconciled and will linger in homeCore"
+            ),
         }
         self.persist_path = Some(path);
     }
@@ -283,6 +340,25 @@ impl DevicePublisher {
             .context("register_device_schema failed")
     }
 
+    /// Publish a device capability schema built as JSON.
+    ///
+    /// The route for a schema carrying **action declarations** — see
+    /// [`device_actions::with_actions`](crate::device_actions::with_actions).
+    /// Deliberately separate from [`Self::register_device_schema`]: the typed
+    /// `DeviceSchema` this SDK compiles against is whatever `hc-types` on
+    /// `main` says it is, so a plugin declaring actions would otherwise wait on
+    /// a core release, an SDK repin and a plugin repin before it could say
+    /// anything new. The `Value` costs compile-time checking of the shape,
+    /// which the builders give back.
+    pub async fn register_device_schema_json(&self, device_id: &str, schema: &Value) -> Result<()> {
+        let topic = format!("homecore/devices/{device_id}/schema");
+        let payload = serde_json::to_vec(schema).context("serialising device schema")?;
+        self.client
+            .publish(&topic, QoS::AtLeastOnce, true, payload)
+            .await
+            .context("register_device_schema_json failed")
+    }
+
     // ── Unregister ───────────────────────────────────────────────────────
 
     /// Retire a device from HomeCore by clearing retained topics and publishing
@@ -390,9 +466,13 @@ impl DevicePublisher {
     /// `register_device_full` of the session. Multiple calls re-load
     /// from the same path which is harmless but pointless.
     ///
-    /// Path is typically `<config_dir>/.published-device-ids.json`.
+    /// Path is typically `<config_dir>/.published-device-ids.json`. As with
+    /// [`PluginClient::with_device_persistence`], the plugin id is inserted
+    /// into the filename so plugins sharing a config directory cannot share a
+    /// snapshot and unregister each other's devices.
     pub fn enable_persistence(&self, path: std::path::PathBuf) {
-        self.devices.lock().unwrap().enable_persistence(path);
+        let scoped = scoped_device_snapshot_path(&path, &self.plugin_id);
+        self.devices.lock().unwrap().enable_persistence(scoped);
     }
 
     /// Reconcile the live device set against everything this plugin
@@ -416,10 +496,7 @@ impl DevicePublisher {
     /// are reported in `unknown_in_live` but otherwise ignored — call
     /// `register_device_full` for them first to bring them into the
     /// tracker.
-    pub async fn reconcile_devices(
-        &self,
-        live: HashSet<String>,
-    ) -> Result<ReconcileReport> {
+    pub async fn reconcile_devices(&self, live: HashSet<String>) -> Result<ReconcileReport> {
         let known = self.devices.lock().unwrap().snapshot();
         let stale: Vec<String> = known.difference(&live).cloned().collect();
         let unknown_in_live: Vec<String> = live.difference(&known).cloned().collect();
@@ -516,6 +593,10 @@ impl DevicePublisher {
     }
 }
 
+/// Boxed handler for management actions the built-in dispatcher does not
+/// recognise. Installed via [`ManagementHandle::with_custom_handler`].
+type CustomActionHandler = Arc<dyn Fn(&Value) -> Option<Value> + Send + Sync>;
+
 /// Handle returned by [`PluginClient::enable_management`].
 ///
 /// Pass this to [`PluginClient::run_managed`] to automatically handle
@@ -525,10 +606,27 @@ pub struct ManagementHandle {
     plugin_id: String,
     config_path: Option<String>,
     log_level_handle: Option<hc_logging::LogLevelHandle>,
-    custom_handler: Option<Arc<dyn Fn(&Value) -> Option<Value> + Send + Sync>>,
+    custom_handler: Option<CustomActionHandler>,
     /// Capability manifest, published retained on
     /// `homecore/plugins/{id}/capabilities` after the first CONNACK.
     capabilities: Option<hc_types::Capabilities>,
+    /// JSON Schema for the plugin's operator config, injected into the
+    /// published capability manifest as `config_schema`. Core extracts it and
+    /// serves it at `GET /plugins/{id}/config/schema` so the config editor can
+    /// render a typed form. `None` → no schema published (editor uses raw TOML).
+    config_schema: Option<Value>,
+    /// The plugin's own config *descriptor*, injected into the published
+    /// capability manifest as `config_descriptor`. Core serves it at
+    /// `GET /plugins/{id}/config/descriptor`; the editor renders it directly
+    /// instead of guessing a form from the schema. `None` → the client
+    /// auto-derives a baseline descriptor from `config_schema`.
+    config_descriptor: Option<Value>,
+    /// Callback invoked with the plugin's durable learned-state document
+    /// (`homecore/plugins/{id}/state`, retained + owned by core) whenever it
+    /// arrives — once shortly after connect, and again on any core-side change.
+    /// Set via [`ManagementHandle::with_state_handler`]; when present the SDK
+    /// subscribes to that topic on connect.
+    state_handler: Option<Arc<dyn Fn(Value) + Send + Sync>>,
     /// Registered streaming action handlers, indexed by action id.
     streaming_actions: Arc<HashMap<String, StreamingAction>>,
     /// Live streams, keyed by `request_id`. Entries are added on
@@ -568,6 +666,52 @@ impl ManagementHandle {
         self
     }
 
+    /// Declare the JSON Schema of the plugin's operator config. The SDK injects
+    /// it into the published capability manifest as `config_schema`; core serves
+    /// it at `GET /plugins/{id}/config/schema` so the config editor can render a
+    /// typed form instead of a raw textarea.
+    ///
+    /// Requires a capability manifest — the schema rides on it, so call
+    /// [`with_capabilities`](Self::with_capabilities) too (an empty manifest is
+    /// fine). Typically `serde_json::to_value(schemars::schema_for!(MyConfig))`.
+    pub fn with_config_schema(mut self, schema: Value) -> Self {
+        self.config_schema = Some(schema);
+        self
+    }
+
+    /// Declare the plugin's own **config descriptor** — an expressive
+    /// description of its configuration (sections, field kinds, conditionals,
+    /// data sources) that the config editor renders directly, rather than
+    /// guessing a form from the JSON Schema.
+    ///
+    /// Rides on the capability manifest exactly like
+    /// [`with_config_schema`](Self::with_config_schema) (so call
+    /// [`with_capabilities`](Self::with_capabilities) too); core serves it at
+    /// `GET /plugins/{id}/config/descriptor`. Publish the schema as well — the
+    /// schema stays authoritative for *existence* and core-side validation,
+    /// while the descriptor annotates *intent*.
+    pub fn with_config_descriptor(mut self, descriptor: Value) -> Self {
+        self.config_descriptor = Some(descriptor);
+        self
+    }
+
+    /// Register a handler for the plugin's durable learned-state document
+    /// (`homecore/plugins/{id}/state`) — vendor secrets the plugin discovers at
+    /// runtime (Hue `app_key`s, OAuth tokens, published-device-ids), which core
+    /// persists and hands back on connect. The SDK subscribes to the topic and
+    /// invokes `f` with the parsed document each time it arrives (once shortly
+    /// after connect via the retained value, then on any change).
+    ///
+    /// Persist updates with [`PluginClient::persist_state`] /
+    /// [`PluginStateWriter::persist`].
+    pub fn with_state_handler<F>(mut self, f: F) -> Self
+    where
+        F: Fn(Value) + Send + Sync + 'static,
+    {
+        self.state_handler = Some(Arc::new(f));
+        self
+    }
+
     /// Register a handler for a streaming action declared in the
     /// capability manifest. When `homecore/plugins/{id}/manage/cmd`
     /// receives a command whose `action` matches `action.id()`, the SDK
@@ -576,8 +720,7 @@ impl ManagementHandle {
     /// stage before returning.
     pub fn with_streaming_action(mut self, action: StreamingAction) -> Self {
         // Arc<HashMap<_,_>> is immutable after clone; rebuild on add.
-        let mut map: HashMap<String, StreamingAction> =
-            (*self.streaming_actions).clone();
+        let mut map: HashMap<String, StreamingAction> = (*self.streaming_actions).clone();
         map.insert(action.id.clone(), action);
         self.streaming_actions = Arc::new(map);
         self
@@ -616,6 +759,42 @@ pub struct PluginClient {
     devices: DeviceTracker,
 }
 
+/// Cloneable handle for persisting plugin learned-state deltas without holding
+/// the `PluginClient` (which `run_managed` consumes). Obtain via
+/// [`PluginClient::state_writer`]; safe to move into callbacks.
+#[derive(Clone)]
+pub struct PluginStateWriter {
+    client: AsyncClient,
+    plugin_id: String,
+}
+
+impl PluginStateWriter {
+    /// Create a `PluginStateWriter` for use in unit tests. The underlying MQTT
+    /// client points at `127.0.0.1:1883` and won't actually send unless a broker
+    /// is running.
+    pub fn test_instance(plugin_id: &str) -> Self {
+        let mut opts = MqttOptions::new(format!("{plugin_id}-state-test"), "127.0.0.1", 1883);
+        opts.set_keep_alive(Duration::from_secs(30));
+        let (client, _eventloop) = AsyncClient::new(opts, 8);
+        Self {
+            client,
+            plugin_id: plugin_id.to_string(),
+        }
+    }
+
+    /// Publish a learned-state delta to `homecore/plugins/{id}/state/set`
+    /// (non-retained). Core merges it and re-publishes the retained
+    /// authoritative `homecore/plugins/{id}/state`.
+    pub async fn persist(&self, delta: &Value) -> Result<()> {
+        let topic = format!("homecore/plugins/{}/state/set", self.plugin_id);
+        let bytes = serde_json::to_vec(delta).context("serialise state delta")?;
+        self.client
+            .publish(&topic, QoS::AtLeastOnce, false, bytes)
+            .await
+            .with_context(|| format!("publish {topic} failed"))
+    }
+}
+
 impl PluginClient {
     async fn clear_retained_topic(&self, topic: &str) -> Result<()> {
         self.client
@@ -629,6 +808,11 @@ impl PluginClient {
         let mut opts = MqttOptions::new(&config.plugin_id, &config.broker_host, config.broker_port);
         opts.set_keep_alive(Duration::from_secs(30));
         opts.set_clean_session(true);
+        // The default max packet size (~10 KB) silently drops a large capability
+        // manifest (rich config schema + actions) at the eventloop — the plugin
+        // stays connected (heartbeats are tiny) but its schema never publishes.
+        // 1 MiB covers any realistic manifest / device payload.
+        opts.set_max_packet_size(1024 * 1024, 1024 * 1024);
         if !config.password.is_empty() {
             opts.set_credentials(&config.plugin_id, &config.password);
         }
@@ -662,10 +846,43 @@ impl PluginClient {
     /// [`DevicePublisher::reconcile_devices`] can clean up devices
     /// that disappeared while the plugin was offline.
     ///
-    /// Path is typically `<config_dir>/.published-device-ids.json`.
+    /// Path is typically `<config_dir>/.published-device-ids.json`. The
+    /// **plugin id is inserted into the filename** — the caller does not have
+    /// to, and must not rely on getting back exactly the path it passed.
+    ///
+    /// That scoping is load-bearing, not tidiness. Every plugin derives this
+    /// path as a sibling of its own config file, and a real deployment keeps
+    /// all plugin configs in one directory — so nine plugins were sharing a
+    /// single `.published-device-ids.json`. Each start-up read the previous
+    /// plugin's device ids, concluded they were its own and now stale,
+    /// unregistered them, and wrote the file back containing only its own. The
+    /// plugins deleted each other's devices in a loop, which looked like
+    /// devices randomly disappearing and coming back.
     pub fn with_device_persistence(self, path: std::path::PathBuf) -> Self {
-        self.devices.lock().unwrap().enable_persistence(path);
+        let scoped = scoped_device_snapshot_path(&path, self.plugin_id());
+        self.devices.lock().unwrap().enable_persistence(scoped);
         self
+    }
+
+    // ── Plugin learned-state (D8 write-back) ─────────────────────────────
+
+    /// Persist a learned-state delta to core. Publishes `delta` to
+    /// `homecore/plugins/{id}/state/set`; core shallow-merges it into the
+    /// durable store and re-publishes the authoritative retained
+    /// `homecore/plugins/{id}/state` (delivered to your
+    /// [`ManagementHandle::with_state_handler`]). Top-level keys set to `null`
+    /// are deleted. Not retained — a one-shot write, not a source of truth.
+    pub async fn persist_state(&self, delta: &Value) -> Result<()> {
+        self.state_writer().persist(delta).await
+    }
+
+    /// A cloneable handle for persisting learned state from anywhere — e.g. a
+    /// callback, after `run_managed` has consumed the client by value.
+    pub fn state_writer(&self) -> PluginStateWriter {
+        PluginStateWriter {
+            client: self.client.clone(),
+            plugin_id: self.config.plugin_id.clone(),
+        }
     }
 
     // ── Full state publishing ────────────────────────────────────────────
@@ -873,6 +1090,25 @@ impl PluginClient {
             .context("register_device_schema failed")
     }
 
+    /// Publish a device capability schema built as JSON.
+    ///
+    /// The route for a schema carrying **action declarations** — see
+    /// [`device_actions::with_actions`](crate::device_actions::with_actions).
+    /// Deliberately separate from [`Self::register_device_schema`]: the typed
+    /// `DeviceSchema` this SDK compiles against is whatever `hc-types` on
+    /// `main` says it is, so a plugin declaring actions would otherwise wait on
+    /// a core release, an SDK repin and a plugin repin before it could say
+    /// anything new. The `Value` costs compile-time checking of the shape,
+    /// which the builders give back.
+    pub async fn register_device_schema_json(&self, device_id: &str, schema: &Value) -> Result<()> {
+        let topic = format!("homecore/devices/{device_id}/schema");
+        let payload = serde_json::to_vec(schema).context("serialising device schema")?;
+        self.client
+            .publish(&topic, QoS::AtLeastOnce, true, payload)
+            .await
+            .context("register_device_schema_json failed")
+    }
+
     // ── Unregister ───────────────────────────────────────────────────────
 
     /// Retire a device from HomeCore by clearing retained topics and publishing
@@ -1010,6 +1246,9 @@ impl PluginClient {
             log_level_handle,
             custom_handler: None,
             capabilities: None,
+            config_schema: None,
+            config_descriptor: None,
+            state_handler: None,
             streaming_actions: Arc::new(HashMap::new()),
             active_streams: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -1171,22 +1410,53 @@ impl PluginClient {
                     // Republish capability manifest retained, if declared.
                     // Retained so late-joining core instances still see it.
                     if let Some(ref mgmt) = mgmt {
-                        if let Some(ref caps) = mgmt.capabilities {
-                            let topic =
-                                format!("homecore/plugins/{}/capabilities", mgmt.plugin_id);
-                            match serde_json::to_vec(caps) {
-                                Ok(bytes) => {
-                                    if let Err(e) = self
-                                        .client
-                                        .publish(&topic, QoS::AtLeastOnce, true, bytes)
-                                        .await
-                                    {
-                                        warn!(error = %e, "Failed to publish capabilities");
-                                    }
+                        // Publish the manifest when the plugin declared capabilities
+                        // OR a config schema — the schema rides on the manifest, so a
+                        // schema-only plugin (no actions) still needs it published.
+                        if mgmt.capabilities.is_some()
+                            || mgmt.config_schema.is_some()
+                            || mgmt.config_descriptor.is_some()
+                        {
+                            let topic = format!("homecore/plugins/{}/capabilities", mgmt.plugin_id);
+                            // Synthesize an empty manifest for a schema-only plugin.
+                            let synthesized;
+                            let caps = match mgmt.capabilities {
+                                Some(ref c) => c,
+                                None => {
+                                    synthesized = hc_types::Capabilities {
+                                        spec: "1".into(),
+                                        plugin_id: mgmt.plugin_id.clone(),
+                                        actions: Vec::new(),
+                                    };
+                                    &synthesized
                                 }
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to serialise capabilities");
+                            };
+                            // The config schema rides on the manifest JSON (core
+                            // extracts it from the raw payload).
+                            let manifest = build_capability_manifest(
+                                caps,
+                                mgmt.config_schema.as_ref(),
+                                mgmt.config_descriptor.as_ref(),
+                            );
+                            if !manifest.is_null() {
+                                let bytes = serde_json::to_vec(&manifest).unwrap_or_default();
+                                if let Err(e) = self
+                                    .client
+                                    .publish(&topic, QoS::AtLeastOnce, true, bytes)
+                                    .await
+                                {
+                                    warn!(error = %e, "Failed to publish capabilities");
                                 }
+                            } else {
+                                warn!("Failed to serialise capabilities");
+                            }
+                        }
+
+                        // Learned-state: subscribe to the retained doc core owns.
+                        if mgmt.state_handler.is_some() {
+                            let topic = format!("homecore/plugins/{}/state", mgmt.plugin_id);
+                            if let Err(e) = self.client.subscribe(&topic, QoS::AtLeastOnce).await {
+                                warn!(error = %e, "Failed to subscribe plugin state");
                             }
                         }
                     }
@@ -1209,7 +1479,9 @@ impl PluginClient {
                                         hc_time::init(tz);
                                         info!(tz = trimmed, "Applied TZ from homecore/system/tz");
                                     }
-                                    Err(e) => warn!(payload = trimmed, error = %e, "Bad TZ in homecore/system/tz"),
+                                    Err(e) => {
+                                        warn!(payload = trimmed, error = %e, "Bad TZ in homecore/system/tz")
+                                    }
                                 }
                             }
                             Err(e) => warn!(error = %e, "Non-UTF8 homecore/system/tz payload"),
@@ -1264,6 +1536,31 @@ impl PluginClient {
                         continue;
                     }
 
+                    // homecore/plugins/{id}/state — durable learned-state doc,
+                    // owned + retained by core. Delivered to the state handler.
+                    if let Some(ref mgmt) = mgmt {
+                        if parts.len() == 4
+                            && parts[0] == "homecore"
+                            && parts[1] == "plugins"
+                            && parts[2] == mgmt.plugin_id
+                            && parts[3] == "state"
+                        {
+                            if let Some(ref handler) = mgmt.state_handler {
+                                // Empty retained payload = core cleared it
+                                // (e.g. on deregister) — nothing to deliver.
+                                if !p.payload.is_empty() {
+                                    match serde_json::from_slice::<Value>(&p.payload) {
+                                        Ok(doc) => handler(doc),
+                                        Err(e) => {
+                                            warn!(topic = %p.topic, error = %e, "Non-JSON plugin state payload")
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
                     // homecore/plugins/{id}/manage/cmd
                     if let Some(ref mgmt) = mgmt {
                         if parts.len() == 5
@@ -1273,12 +1570,7 @@ impl PluginClient {
                             && parts[4] == "cmd"
                         {
                             if let Ok(cmd) = serde_json::from_slice::<Value>(&p.payload) {
-                                let resp = dispatch_management_cmd(
-                                    mgmt,
-                                    &self.client,
-                                    &cmd,
-                                )
-                                .await;
+                                let resp = dispatch_management_cmd(mgmt, &self.client, &cmd).await;
                                 let resp_topic =
                                     format!("homecore/plugins/{}/manage/response", mgmt.plugin_id);
                                 let _ = self
@@ -1301,6 +1593,30 @@ impl PluginClient {
                 }
             }
         }
+    }
+}
+
+/// Serialise the capability manifest and inject `config_schema` (which rides on
+/// the manifest JSON, not the frozen `Capabilities` type). Returns `Value::Null`
+/// if `caps` fails to serialise.
+fn build_capability_manifest(
+    caps: &hc_types::Capabilities,
+    config_schema: Option<&Value>,
+    config_descriptor: Option<&Value>,
+) -> Value {
+    match serde_json::to_value(caps) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(schema) = config_schema {
+                    obj.insert("config_schema".into(), schema.clone());
+                }
+                if let Some(descriptor) = config_descriptor {
+                    obj.insert("config_descriptor".into(), descriptor.clone());
+                }
+            }
+            v
+        }
+        Err(_) => Value::Null,
     }
 }
 
@@ -1327,7 +1643,9 @@ async fn dispatch_management_cmd(
         let found = {
             let map = mgmt.active_streams.lock().unwrap();
             if let Some(entry) = map.get(target) {
-                entry.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                entry
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 true
             } else {
                 false
@@ -1588,5 +1906,77 @@ fn handle_management_cmd(mgmt: &ManagementHandle, cmd: &Value) -> Value {
                 "error": format!("unknown action: {action}"),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod device_snapshot_path_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The bug this guards: every plugin derives its snapshot path as a sibling
+    /// of its own config, and real deployments keep all plugin configs in one
+    /// directory — so the unscoped name collided and plugins unregistered each
+    /// other's devices.
+    #[test]
+    fn two_plugins_in_one_config_dir_get_different_files() {
+        let shared = Path::new("/config/plugins/.published-device-ids.json");
+        let hue = scoped_device_snapshot_path(shared, "plugin.hue");
+        let sonos = scoped_device_snapshot_path(shared, "plugin.sonos");
+        assert_ne!(hue, sonos);
+        assert_eq!(
+            hue,
+            Path::new("/config/plugins/.published-device-ids.plugin.hue.json")
+        );
+    }
+
+    /// Plugin ids contain dots, so a file_stem/extension implementation would
+    /// treat "hue" as the extension and mangle the name.
+    #[test]
+    fn dotted_plugin_id_is_not_mistaken_for_an_extension() {
+        let p =
+            scoped_device_snapshot_path(Path::new("/c/.published-device-ids.json"), "plugin.hue");
+        assert_eq!(p.extension().and_then(|e| e.to_str()), Some("json"));
+    }
+
+    #[test]
+    fn scoping_is_idempotent() {
+        let once =
+            scoped_device_snapshot_path(Path::new("/c/.published-device-ids.json"), "plugin.hue");
+        let twice = scoped_device_snapshot_path(&once, "plugin.hue");
+        assert_eq!(once, twice);
+    }
+}
+
+#[cfg(test)]
+mod config_schema_tests {
+    use super::*;
+
+    fn caps() -> hc_types::Capabilities {
+        hc_types::Capabilities {
+            spec: "1".into(),
+            plugin_id: "plugin.hue".into(),
+            actions: vec![],
+        }
+    }
+
+    #[test]
+    fn manifest_injects_config_schema_when_present() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "poll_interval_secs": { "type": "integer" } }
+        });
+        let m = build_capability_manifest(&caps(), Some(&schema), None);
+        assert_eq!(m["plugin_id"], "plugin.hue");
+        assert_eq!(m["spec"], "1");
+        assert_eq!(m["config_schema"], schema);
+    }
+
+    #[test]
+    fn manifest_omits_config_schema_when_absent() {
+        let m = build_capability_manifest(&caps(), None, None);
+        assert!(m.get("config_schema").is_none());
+        // Base manifest still intact.
+        assert_eq!(m["plugin_id"], "plugin.hue");
     }
 }

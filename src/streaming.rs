@@ -61,8 +61,7 @@ impl StreamingAction {
         F: Fn(StreamContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        let handler: StreamingHandler =
-            Arc::new(move |ctx, params| Box::pin(handler(ctx, params)));
+        let handler: StreamingHandler = Arc::new(move |ctx, params| Box::pin(handler(ctx, params)));
         Self {
             id: id.into(),
             handler,
@@ -101,8 +100,7 @@ impl StreamContext {
         terminal: Arc<AtomicBool>,
         respond_rx: mpsc::UnboundedReceiver<Value>,
     ) -> Self {
-        let stream_topic =
-            format!("homecore/plugins/{plugin_id}/commands/{request_id}/events");
+        let stream_topic = format!("homecore/plugins/{plugin_id}/commands/{request_id}/events");
         Self {
             request_id,
             plugin_id,
@@ -240,11 +238,7 @@ impl StreamContext {
     /// Emit a `warning` event. Non-terminal — stream continues. Use for
     /// recoverable conditions the user should see (retry, transient
     /// failure). Unrecoverable failures use [`StreamContext::error`].
-    pub async fn warning(
-        &self,
-        message: impl Into<String>,
-        data: Option<Value>,
-    ) -> Result<()> {
+    pub async fn warning(&self, message: impl Into<String>, data: Option<Value>) -> Result<()> {
         let mut ev = json!({
             "stage": "warning",
             "message": message.into(),
