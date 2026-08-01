@@ -239,6 +239,19 @@ pub struct PluginNotices {
 }
 
 impl PluginNotices {
+    /// Create a detached handle for use in unit tests.
+    ///
+    /// Notices raised on it are held in memory and never reach a heartbeat,
+    /// which is what a test wants: constructing whatever owns the handle
+    /// should not require a broker. Deliberately a named constructor rather
+    /// than a `Default` impl, so a detached handle cannot be created by
+    /// accident somewhere that expected notices to actually be delivered.
+    pub fn test_instance() -> Self {
+        Self {
+            inner: NoticeTracker::default(),
+        }
+    }
+
     /// Raise a notice, replacing any existing one with the same `code`.
     ///
     /// Keying on `code` is what makes this safe to call from a polling loop:
