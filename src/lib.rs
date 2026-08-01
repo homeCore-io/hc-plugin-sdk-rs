@@ -42,6 +42,11 @@ pub mod types {
     pub use hc_types::plugin_capabilities::{
         Action, Capabilities, Concurrency, ItemOp, RequiresRole,
     };
+    // Needed to construct anything for `PluginClient::notices()`. Without this
+    // a plugin would have to depend on hc-types directly, which is exactly what
+    // this module exists to avoid — and 0.3.7 shipped the handle without it,
+    // making the feature uncallable.
+    pub use hc_types::{NoticeLevel, PluginNotice};
     pub use hc_types::schema;
     pub use hc_types::schema::{
         AttributeKind, AttributeSchema, BoolStates, DeviceSchema, StateLabel,
