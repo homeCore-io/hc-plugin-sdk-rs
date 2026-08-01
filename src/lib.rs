@@ -46,11 +46,11 @@ pub mod types {
     // a plugin would have to depend on hc-types directly, which is exactly what
     // this module exists to avoid — and 0.3.7 shipped the handle without it,
     // making the feature uncallable.
-    pub use hc_types::{NoticeLevel, PluginNotice};
     pub use hc_types::schema;
     pub use hc_types::schema::{
         AttributeKind, AttributeSchema, BoolStates, DeviceSchema, StateLabel,
     };
+    pub use hc_types::{NoticeLevel, PluginNotice};
 }
 
 /// Re-exports of `hc-logging` items plugins use directly. Today every
@@ -1317,12 +1317,22 @@ impl PluginClient {
                 let payload = serde_json::json!({
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                     "version": hb_version,
-                    // SDK build version — auto-populated from this crate's
-                    // CARGO_PKG_VERSION at compile time. Core's state_bridge
-                    // reads this on first heartbeat per plugin per session
-                    // and warns if MAJOR/MINOR diverge from
-                    // hc-types::PROTOCOL_VERSION. Component versioning Phase B.
+                    // This crate's own version. Informational only: it tells
+                    // an operator which SDK to rebuild against, and appears in
+                    // core's logs beside any protocol complaint.
+                    //
+                    // It is deliberately NOT what core checks compatibility on.
+                    // It used to be, compared against hc_types::PROTOCOL_VERSION
+                    // — but this crate and hc-types are versioned independently
+                    // (0.3.x against 0.1.x), and below 1.0 a differing MINOR
+                    // reads as breaking, so the check could never pass and
+                    // warned about every plugin forever.
                     "sdk_version": env!("CARGO_PKG_VERSION"),
+                    // The wire protocol this plugin was compiled against — the
+                    // hc-types version, which is what actually decides whether
+                    // core and this plugin agree on the shape of a device, an
+                    // event, or a command. Core compares it against its own.
+                    "protocol_version": hc_types::PROTOCOL_VERSION,
                     "uptime_secs": uptime_secs,
                     "device_count": device_count,
                     // Full current set every beat — core replaces rather than
