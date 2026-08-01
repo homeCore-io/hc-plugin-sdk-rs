@@ -59,6 +59,7 @@ pub mod logging {
 
 use anyhow::{Context, Result};
 use hc_types::device::{change_from_command_payload, with_state_change_metadata, DeviceChange};
+use hc_types::PluginNotice;
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, Packet, QoS};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -187,6 +188,88 @@ impl DeviceTrackerInner {
 /// from spawned tasks are reflected in the heartbeat's `device_count`
 /// and in `reconcile_devices`.
 type DeviceTracker = Arc<Mutex<DeviceTrackerInner>>;
+
+/// Shared set of notices this plugin is currently reporting about itself.
+/// Cloned into the heartbeat task and into every [`PluginNotices`] handle, so
+/// a condition detected deep in a spawned task reaches core on the next beat.
+type NoticeTracker = Arc<Mutex<Vec<PluginNotice>>>;
+
+/// Handle for reporting what is wrong with this plugin.
+///
+/// A plugin that starts cleanly but cannot do its job is the case this exists
+/// for — a receiver bound to an address nothing can reach, a credential that
+/// is absent, a gateway that has never once answered. Logging it is not enough:
+/// the operator is looking at the plugin page, where the plugin reads `active`.
+///
+/// The notices you hold are **current state**, republished in full on every
+/// heartbeat. Core replaces its copy each time, so:
+///
+/// - raise a notice when you detect the condition,
+/// - clear it when it resolves,
+/// - and never worry about a stale one lingering — if you stop reporting it,
+///   it disappears from the UI on the next beat.
+///
+/// Obtain one with [`PluginClient::notices`] *before* calling `run()`, since
+/// `run()` consumes the client. The handle is `Clone` and cheap to move into
+/// tasks.
+///
+/// ```rust,ignore
+/// let notices = client.notices();
+/// if bind_is_loopback && cfg.gateway_ip.is_none() {
+///     notices.raise(
+///         PluginNotice::warning(
+///             "receiver_unreachable",
+///             "The receiver is bound to loopback, so uploads from a gateway \
+///              elsewhere on the network are dropped before they arrive.",
+///         )
+///         .with_remedy(r#"Set [ecowitt].bind_addr = "0.0.0.0"."#),
+///     );
+/// } else {
+///     notices.clear("receiver_unreachable");
+/// }
+/// ```
+#[derive(Clone)]
+pub struct PluginNotices {
+    inner: NoticeTracker,
+}
+
+impl PluginNotices {
+    /// Raise a notice, replacing any existing one with the same `code`.
+    ///
+    /// Keying on `code` is what makes this safe to call from a polling loop:
+    /// re-raising the same condition every 30 seconds updates in place instead
+    /// of accumulating duplicates.
+    pub fn raise(&self, notice: PluginNotice) {
+        let mut set = self.inner.lock().unwrap();
+        match set.iter_mut().find(|n| n.code == notice.code) {
+            Some(existing) => *existing = notice,
+            None => set.push(notice),
+        }
+    }
+
+    /// Clear the notice with this `code`, if present. Idempotent — clearing a
+    /// condition that was never raised is a no-op, so callers can clear
+    /// unconditionally on the healthy branch.
+    pub fn clear(&self, code: &str) {
+        self.inner.lock().unwrap().retain(|n| n.code != code);
+    }
+
+    /// Replace the entire set. For plugins that recompute every condition in
+    /// one pass and would rather state the result than diff it.
+    pub fn set(&self, notices: Vec<PluginNotice>) {
+        *self.inner.lock().unwrap() = notices;
+    }
+
+    /// Drop every notice.
+    pub fn clear_all(&self) {
+        self.inner.lock().unwrap().clear();
+    }
+
+    /// Snapshot of what would be sent on the next heartbeat.
+    pub fn current(&self) -> Vec<PluginNotice> {
+        self.inner.lock().unwrap().clone()
+    }
+}
 
 /// Outcome of [`DevicePublisher::reconcile_devices`].
 #[derive(Debug, Default)]
@@ -757,6 +840,7 @@ pub struct PluginClient {
     config: PluginConfig,
     subscriptions: SubscriptionTracker,
     devices: DeviceTracker,
+    notices: NoticeTracker,
 }
 
 /// Cloneable handle for persisting plugin learned-state deltas without holding
@@ -825,6 +909,7 @@ impl PluginClient {
             config,
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
             devices: Arc::new(Mutex::new(DeviceTrackerInner::default())),
+            notices: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -878,6 +963,14 @@ impl PluginClient {
 
     /// A cloneable handle for persisting learned state from anywhere — e.g. a
     /// callback, after `run_managed` has consumed the client by value.
+    /// Handle for reporting conditions that stop this plugin working.
+    /// Take it before `run()` consumes the client. See [`PluginNotices`].
+    pub fn notices(&self) -> PluginNotices {
+        PluginNotices {
+            inner: Arc::clone(&self.notices),
+        }
+    }
+
     pub fn state_writer(&self) -> PluginStateWriter {
         PluginStateWriter {
             client: self.client.clone(),
@@ -1208,6 +1301,7 @@ impl PluginClient {
         let hb_plugin_id = self.config.plugin_id.clone();
         let hb_version = version.clone();
         let hb_devices = Arc::clone(&self.devices);
+        let hb_notices = Arc::clone(&self.notices);
         let started_at = std::time::Instant::now();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -1226,6 +1320,10 @@ impl PluginClient {
                     "sdk_version": env!("CARGO_PKG_VERSION"),
                     "uptime_secs": uptime_secs,
                     "device_count": device_count,
+                    // Full current set every beat — core replaces rather than
+                    // merges, so a cleared condition disappears on its own and
+                    // there is nothing to expire.
+                    "notices": hb_notices.lock().unwrap().clone(),
                 });
                 let topic = format!("homecore/plugins/{hb_plugin_id}/heartbeat");
                 let _ = hb_client
@@ -1978,5 +2076,89 @@ mod config_schema_tests {
         assert!(m.get("config_schema").is_none());
         // Base manifest still intact.
         assert_eq!(m["plugin_id"], "plugin.hue");
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+    use hc_types::NoticeLevel;
+
+    fn handle() -> PluginNotices {
+        PluginNotices {
+            inner: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[test]
+    fn raise_dedupes_on_code() {
+        // The motivating shape: a plugin re-detects the same condition on every
+        // poll and re-raises it. That must update in place, not accumulate — a
+        // 30-second heartbeat would otherwise grow the payload without bound.
+        let n = handle();
+        n.raise(PluginNotice::warning("receiver_unreachable", "first"));
+        n.raise(PluginNotice::warning("receiver_unreachable", "second"));
+        n.raise(PluginNotice::error("other", "x"));
+        let cur = n.current();
+        assert_eq!(cur.len(), 2);
+        let first = cur
+            .iter()
+            .find(|x| x.code == "receiver_unreachable")
+            .unwrap();
+        assert_eq!(first.message, "second", "re-raise must replace, not append");
+    }
+
+    #[test]
+    fn clear_is_idempotent_and_targeted() {
+        // Callers clear unconditionally on the healthy branch, so clearing
+        // something never raised must be a no-op rather than a panic.
+        let n = handle();
+        n.clear("never_raised");
+        n.raise(PluginNotice::warning("a", "m"));
+        n.raise(PluginNotice::warning("b", "m"));
+        n.clear("a");
+        n.clear("a");
+        let codes: Vec<String> = n.current().into_iter().map(|x| x.code).collect();
+        assert_eq!(codes, vec!["b"]);
+    }
+
+    #[test]
+    fn set_replaces_wholesale() {
+        let n = handle();
+        n.raise(PluginNotice::warning("old", "m"));
+        n.set(vec![PluginNotice::info("new", "m")]);
+        let cur = n.current();
+        assert_eq!(cur.len(), 1);
+        assert_eq!(cur[0].code, "new");
+        assert_eq!(cur[0].level, NoticeLevel::Info);
+    }
+
+    #[test]
+    fn clones_share_one_set() {
+        // The handle is cloned into spawned tasks; a condition detected there
+        // has to reach the heartbeat task holding a different clone.
+        let a = handle();
+        let b = a.clone();
+        b.raise(PluginNotice::error("from_task", "m"));
+        assert_eq!(a.current().len(), 1);
+        a.clear("from_task");
+        assert!(b.current().is_empty());
+    }
+
+    #[test]
+    fn empty_set_serialises_as_an_empty_array() {
+        // What every plugin that never raises anything sends. Core reads it as
+        // "nothing to report", identical to omitting the field.
+        let n = handle();
+        assert_eq!(serde_json::to_string(&n.current()).unwrap(), "[]");
+    }
+
+    #[test]
+    fn remedy_survives_the_wire() {
+        let n = handle();
+        n.raise(PluginNotice::warning("receiver_unreachable", "msg").with_remedy("set bind_addr"));
+        let json = serde_json::to_string(&n.current()).unwrap();
+        let back: Vec<PluginNotice> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back[0].remedy.as_deref(), Some("set bind_addr"));
     }
 }
