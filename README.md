@@ -6,7 +6,10 @@ protocol, capability actions, and notices.
 
 The crate is named **`plugin-sdk-rs`**.
 
-## Quick start
+## Installing
+
+Declare the git dependency, pinned to a tag. **The crate is not on crates.io**,
+by design — plugins pin the SDK by tag and adopt updates on their own cadence.
 
 ```toml
 [dependencies]
@@ -15,6 +18,32 @@ tokio         = { version = "1", features = ["full"] }
 anyhow        = "1"
 serde_json    = "1"
 ```
+
+### Working inside the homeCore workspace
+
+Leave that dependency exactly as it is. The meta-workspace at `plugins/Cargo.toml`
+redirects it to the checkout:
+
+```toml
+[patch."https://github.com/homeCore-io/hc-plugin-sdk-rs"]
+plugin-sdk-rs = { path = "../sdks/hc-plugin-sdk-rs" }
+```
+
+So a plugin built from inside `plugins/` compiles against `sdks/hc-plugin-sdk-rs`
+on disk, while its committed `Cargo.toml` still says the tag — which is what CI
+clones and builds standalone. Confirm which one you are getting with:
+
+```sh
+cargo tree -p hc-yourplugin -i plugin-sdk-rs
+# plugin-sdk-rs v0.3.10 (/…/sdks/hc-plugin-sdk-rs)   ← local
+# plugin-sdk-rs v0.3.10 (https://github.com/…)        ← the tag
+```
+
+Do **not** change the dependency to a `path` in a plugin's own `Cargo.toml`:
+standalone CI has no workspace to patch it, and the build breaks there while
+working fine on your machine.
+
+## Quick start
 
 ```rust
 use plugin_sdk_rs::{PluginClient, PluginConfig};
