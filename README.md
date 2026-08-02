@@ -47,9 +47,10 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 Real plugins call `run_managed` instead, so homeCore can supervise them —
-see below. Start from
-[hc-plugin-template](https://github.com/homeCore-io/hc-plugin-template), or
-read [hc-roku](https://github.com/homeCore-io/hc-roku) for a complete one.
+see below. To copy from something working, read
+[hc-wled](https://github.com/homeCore-io/hc-wled) first (the smallest complete
+plugin), then [hc-roku](https://github.com/homeCore-io/hc-roku) for discovery,
+notices, and capability actions together.
 
 ## What it gives you
 
