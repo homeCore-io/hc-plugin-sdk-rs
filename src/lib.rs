@@ -53,14 +53,9 @@ pub mod types {
     pub use hc_types::{NoticeLevel, PluginNotice};
 }
 
-/// Re-exports of `hc-logging` items plugins use directly. Today every
-/// plugin uses [`LogLevelHandle`] in `main.rs` for dynamic log-level
-/// setup; [`with_noise_suppression`] is for the same setup path.
-/// `MqttLogLayer` already lives in this crate (see `mqtt_log_layer`),
-/// so nothing else needs re-exporting.
-pub mod logging {
-    pub use hc_logging::{with_noise_suppression, LogLevelHandle};
-}
+/// Log rotation, compression, retention, and the plugin's tracing setup.
+/// Also re-exports the `hc-logging` items plugins use directly.
+pub mod logging;
 
 use anyhow::{Context, Result};
 use hc_types::device::{change_from_command_payload, with_state_change_metadata, DeviceChange};
